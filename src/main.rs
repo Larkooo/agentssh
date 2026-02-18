@@ -1,4 +1,5 @@
 mod agents;
+mod pathnav;
 mod tmux;
 
 use agents::AgentDefinition;
@@ -9,18 +10,19 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use pathnav::{ActivateResult, Browser, EntryKind};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Text},
+    symbols::border,
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 use std::{
     env,
     io::{self, Stdout},
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -44,32 +46,37 @@ enum SpawnStep {
     Path,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PathInputMode {
-    Presets,
-    Custom,
-}
-
 #[derive(Debug, Clone)]
 struct SpawnModal {
     step: SpawnStep,
     selected_agent: usize,
-    selected_path: usize,
-    path_input_mode: PathInputMode,
-    custom_path: String,
-    path_options: Vec<String>,
+    browser: Browser,
 }
 
-impl SpawnModal {
-    fn selected_working_dir(&self) -> Option<String> {
-        if self.path_input_mode == PathInputMode::Custom {
-            let custom = self.custom_path.trim();
-            if !custom.is_empty() {
-                return Some(custom.to_owned());
-            }
-        }
+#[derive(Debug, Clone, Copy)]
+struct UiTheme {
+    bg: Color,
+    panel_bg: Color,
+    border: Color,
+    text: Color,
+    muted: Color,
+    accent: Color,
+    success: Color,
+    warning: Color,
+}
 
-        self.path_options.get(self.selected_path).cloned()
+impl UiTheme {
+    fn new() -> Self {
+        Self {
+            bg: Color::Rgb(12, 16, 24),
+            panel_bg: Color::Rgb(20, 26, 38),
+            border: Color::Rgb(67, 86, 113),
+            text: Color::Rgb(222, 231, 243),
+            muted: Color::Rgb(149, 163, 186),
+            accent: Color::Rgb(120, 205, 255),
+            success: Color::Rgb(126, 231, 135),
+            warning: Color::Rgb(255, 214, 117),
+        }
     }
 }
 
@@ -83,6 +90,7 @@ struct App {
     refresh_interval: Duration,
     should_quit: bool,
     status_line: String,
+    theme: UiTheme,
 }
 
 impl App {
@@ -97,6 +105,7 @@ impl App {
             refresh_interval,
             should_quit: false,
             status_line: "Select [+ New Instance] and press Enter".to_owned(),
+            theme: UiTheme::new(),
         }
     }
 
@@ -127,7 +136,7 @@ impl App {
                 self.clamp_selection();
 
                 self.status_line = format!(
-                    "{} instance(s) running | {} agent CLI(s) detected",
+                    "{} running | {} CLIs detected",
                     self.instances.len(),
                     self.available_agents.len()
                 );
@@ -228,35 +237,31 @@ impl App {
         }
     }
 
-    fn open_new_modal(&mut self) {
+    fn open_spawn_modal(&mut self) {
         if self.available_agents.is_empty() {
             self.status_line = "No supported agent CLIs found in PATH".to_owned();
             return;
         }
 
-        self.modal = Some(SpawnModal {
-            step: SpawnStep::Agent,
-            selected_agent: 0,
-            selected_path: 0,
-            path_input_mode: PathInputMode::Presets,
-            custom_path: String::new(),
-            path_options: default_working_paths(),
-        });
+        let start = env::current_dir().unwrap_or_else(|_| "/".into());
+        match Browser::new(start) {
+            Ok(browser) => {
+                self.modal = Some(SpawnModal {
+                    step: SpawnStep::Agent,
+                    selected_agent: 0,
+                    browser,
+                });
+            }
+            Err(err) => {
+                self.status_line = format!("Cannot open path browser: {err}");
+            }
+        }
     }
 
-    fn create_instance_from_modal(&mut self) {
-        let Some(modal) = self.modal.as_ref() else {
-            return;
-        };
-
-        let Some(agent) = self.available_agents.get(modal.selected_agent).cloned() else {
+    fn create_instance(&mut self, agent_index: usize, working_dir: String) {
+        let Some(agent) = self.available_agents.get(agent_index).cloned() else {
             self.status_line = "Invalid agent selection".to_owned();
             self.modal = None;
-            return;
-        };
-
-        let Some(working_dir) = modal.selected_working_dir() else {
-            self.status_line = "Select or type a working directory first".to_owned();
             return;
         };
 
@@ -376,29 +381,32 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
     enum Action {
         None,
         Close,
-        Create,
+        Create {
+            agent_index: usize,
+            working_dir: String,
+        },
     }
 
     let mut action = Action::None;
+    let mut status_override: Option<String> = None;
 
     if let Some(modal) = app.modal.as_mut() {
         match modal.step {
             SpawnStep::Agent => match code {
                 KeyCode::Esc => action = Action::Close,
                 KeyCode::Char('j') | KeyCode::Down => {
-                    if app.available_agents.is_empty() {
-                        return;
+                    if !app.available_agents.is_empty() {
+                        modal.selected_agent =
+                            (modal.selected_agent + 1) % app.available_agents.len();
                     }
-                    modal.selected_agent = (modal.selected_agent + 1) % app.available_agents.len();
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    if app.available_agents.is_empty() {
-                        return;
-                    }
-                    if modal.selected_agent == 0 {
-                        modal.selected_agent = app.available_agents.len() - 1;
-                    } else {
-                        modal.selected_agent -= 1;
+                    if !app.available_agents.is_empty() {
+                        if modal.selected_agent == 0 {
+                            modal.selected_agent = app.available_agents.len() - 1;
+                        } else {
+                            modal.selected_agent -= 1;
+                        }
                     }
                 }
                 KeyCode::Enter => modal.step = SpawnStep::Path,
@@ -407,50 +415,36 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
             SpawnStep::Path => match code {
                 KeyCode::Esc => action = Action::Close,
                 KeyCode::Left | KeyCode::Char('h') => modal.step = SpawnStep::Agent,
-                KeyCode::Tab | KeyCode::BackTab => {
-                    modal.path_input_mode = match modal.path_input_mode {
-                        PathInputMode::Presets => PathInputMode::Custom,
-                        PathInputMode::Custom => PathInputMode::Presets,
+                KeyCode::Char('j') | KeyCode::Down => modal.browser.next(),
+                KeyCode::Char('k') | KeyCode::Up => modal.browser.previous(),
+                KeyCode::Enter => match modal.browser.activate_selected() {
+                    Ok(ActivateResult::Selected(path)) => {
+                        action = Action::Create {
+                            agent_index: modal.selected_agent,
+                            working_dir: path.to_string_lossy().to_string(),
+                        };
                     }
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if modal.path_input_mode == PathInputMode::Presets
-                        && !modal.path_options.is_empty()
-                    {
-                        modal.selected_path = (modal.selected_path + 1) % modal.path_options.len();
+                    Ok(ActivateResult::ChangedDirectory) => {}
+                    Err(err) => {
+                        status_override = Some(format!("Path navigation failed: {err}"));
                     }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    if modal.path_input_mode == PathInputMode::Presets
-                        && !modal.path_options.is_empty()
-                    {
-                        if modal.selected_path == 0 {
-                            modal.selected_path = modal.path_options.len() - 1;
-                        } else {
-                            modal.selected_path -= 1;
-                        }
-                    }
-                }
-                KeyCode::Backspace => {
-                    if modal.path_input_mode == PathInputMode::Custom {
-                        modal.custom_path.pop();
-                    }
-                }
-                KeyCode::Char(c) => {
-                    if modal.path_input_mode == PathInputMode::Custom {
-                        modal.custom_path.push(c);
-                    }
-                }
-                KeyCode::Enter => action = Action::Create,
+                },
                 _ => {}
             },
         }
     }
 
+    if let Some(status) = status_override {
+        app.status_line = status;
+    }
+
     match action {
         Action::None => {}
         Action::Close => app.modal = None,
-        Action::Create => app.create_instance_from_modal(),
+        Action::Create {
+            agent_index,
+            working_dir,
+        } => app.create_instance(agent_index, working_dir),
     }
 }
 
@@ -475,11 +469,10 @@ fn handle_main_key(
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => app.next_tab(),
         KeyCode::Char('d') => app.selected_tab = 0,
         KeyCode::Char('x') => app.kill_selected_instance(),
-        KeyCode::Char('n') => app.open_new_modal(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Enter => {
             if app.selected_tab == 0 && app.is_action_row_selected() {
-                app.open_new_modal();
+                app.open_spawn_modal();
             } else if let Some(instance) = app.active_instance_ref() {
                 let attach_result = attach_into_session(terminal, &instance.session.name);
                 match attach_result {
@@ -524,6 +517,15 @@ fn attach_into_session(
 }
 
 fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let theme = app.theme;
+
+    frame.render_widget(
+        Block::default()
+            .style(Style::default().bg(theme.bg))
+            .borders(Borders::NONE),
+        frame.area(),
+    );
+
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -549,22 +551,36 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
 }
 
 fn draw_tabs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let theme = app.theme;
     let titles = app.tab_titles();
+
     let tabs = Tabs::new(titles)
         .select(app.selected_tab)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" agentssh ")
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .title(Line::from(vec![
+                    Span::styled(
+                        " agentssh ",
+                        Style::default()
+                            .fg(theme.bg)
+                            .bg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  multi-agent runtime", Style::default().fg(theme.muted)),
+                ]))
+                .border_set(border::ROUNDED)
+                .style(Style::default().bg(theme.panel_bg).fg(theme.text))
+                .border_style(Style::default().fg(theme.border)),
         )
-        .style(Style::default().fg(Color::Gray))
+        .style(Style::default().fg(theme.muted).bg(theme.panel_bg))
         .highlight_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.bg)
+                .bg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
-        .divider("|");
+        .divider(" ");
 
     frame.render_widget(tabs, area);
 }
@@ -580,6 +596,8 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let theme = app.theme;
+
     let mut rows: Vec<Row<'_>> = app
         .instances
         .iter()
@@ -603,6 +621,7 @@ fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 Cell::from(marker),
                 Cell::from(instance.session.last_line.clone()),
             ])
+            .style(Style::default().fg(theme.text).bg(theme.panel_bg))
         })
         .collect();
 
@@ -610,12 +629,12 @@ fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Row::new(vec![
             Cell::from("+"),
             Cell::from("action"),
-            Cell::from("[+ New Instance]"),
+            Cell::from("New Instance"),
             Cell::from(""),
             Cell::from(""),
-            Cell::from("Start a new agent session"),
+            Cell::from("Open creation wizard"),
         ])
-        .style(Style::default().fg(Color::Green)),
+        .style(Style::default().fg(theme.success).bg(theme.panel_bg)),
     );
 
     let table = Table::new(
@@ -640,21 +659,18 @@ fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ])
         .style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
+                .bg(theme.panel_bg)
                 .add_modifier(Modifier::BOLD),
         ),
     )
     .row_highlight_style(
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme.bg)
+            .bg(theme.warning)
             .add_modifier(Modifier::BOLD),
     )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Instances ")
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
+    .block(panel_block(" Instances ", theme));
 
     let mut state = TableState::default();
     state.select(Some(app.selected_row));
@@ -663,6 +679,8 @@ fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let theme = app.theme;
+
     let lines = if app.is_action_row_selected() || app.instances.is_empty() {
         let available = if app.available_agents.is_empty() {
             "none".to_owned()
@@ -675,9 +693,15 @@ fn draw_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         };
 
         vec![
-            Line::from("Create new instance"),
+            Line::from(Span::styled(
+                "Create a new instance",
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            )),
             Line::from(""),
-            Line::from("Select [+ New Instance] in the list and press Enter."),
+            Line::from("Select New Instance in the list and press Enter."),
+            Line::from("Then choose agent + folder in the wizard."),
             Line::from(""),
             Line::from("Detected CLIs:"),
             Line::from(available),
@@ -719,18 +743,16 @@ fn draw_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
 
     let panel = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Summary ")
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
+        .style(Style::default().fg(theme.text).bg(theme.panel_bg))
+        .block(panel_block(" Summary ", theme))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(panel, area);
 }
 
 fn draw_instance_tab(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let theme = app.theme;
+
     let Some(instance) = app.current_tab_instance() else {
         draw_dashboard(frame, area, app);
         return;
@@ -764,12 +786,8 @@ fn draw_instance_tab(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         )),
         Line::from(format!("Command: {}", instance.session.current_command)),
     ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Instance ")
-            .border_style(Style::default().fg(Color::DarkGray)),
-    )
+    .style(Style::default().fg(theme.text).bg(theme.panel_bg))
+    .block(panel_block(" Instance ", theme))
     .wrap(Wrap { trim: false });
 
     let preview = if instance.session.preview.is_empty() {
@@ -784,12 +802,8 @@ fn draw_instance_tab(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
 
     let preview_panel = Paragraph::new(Text::from(preview))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Live Buffer ")
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
+        .style(Style::default().fg(theme.text).bg(theme.panel_bg))
+        .block(panel_block(" Live Buffer ", theme))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(details, chunks[0]);
@@ -797,30 +811,33 @@ fn draw_instance_tab(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let commands = "Use arrows + Enter. New instance is an action row in the list.";
-    let shortcuts = "Shortcuts: Tab/←/→ tabs  x stop  r refresh  q quit";
+    let theme = app.theme;
+
+    let commands = Line::from(vec![
+        Span::styled("arrows + enter", Style::default().fg(theme.warning)),
+        Span::styled(" to navigate and open.", Style::default().fg(theme.text)),
+        Span::styled("  tab/left/right", Style::default().fg(theme.warning)),
+        Span::styled(" for tabs.", Style::default().fg(theme.text)),
+    ]);
+
     let panel = Paragraph::new(Text::from(vec![
-        Line::from(commands),
-        Line::from(shortcuts),
+        commands,
         Line::from(app.status_line.clone()),
     ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Controls ")
-            .border_style(Style::default().fg(Color::DarkGray)),
-    )
+    .style(Style::default().fg(theme.text).bg(theme.panel_bg))
+    .block(panel_block(" Controls ", theme))
     .wrap(Wrap { trim: false });
 
     frame.render_widget(panel, area);
 }
 
 fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let theme = app.theme;
     let Some(modal) = app.modal.as_ref() else {
         return;
     };
 
-    let area = centered_rect(70, 65, frame.area());
+    let area = centered_rect(72, 74, frame.area());
     frame.render_widget(Clear, area);
 
     let selected_agent = app
@@ -830,22 +847,27 @@ fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
         .unwrap_or_else(|| "none".to_owned());
 
     let mut lines = vec![
-        Line::from("Create a new agent instance"),
+        Line::from(Span::styled(
+            "Create New Instance",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from(format!(
-            "1) Agent  [{}]",
+            "1) Agent [{}]",
             if modal.step == SpawnStep::Agent {
-                "ACTIVE"
+                "active"
             } else {
                 "done"
             }
         )),
-        Line::from(format!("   Selected: {}", selected_agent)),
+        Line::from(format!("   {}", selected_agent)),
         Line::from(""),
         Line::from(format!(
-            "2) Working Directory  [{}]",
+            "2) Working Directory [{}]",
             if modal.step == SpawnStep::Path {
-                "ACTIVE"
+                "active"
             } else {
                 "pending"
             }
@@ -862,81 +884,57 @@ fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
                 )));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from("enter next   esc cancel   ↑/↓ move"));
+            lines.push(Line::from("enter next   esc cancel   up/down move"));
         }
         SpawnStep::Path => {
-            lines.push(Line::from("   Presets:"));
-            for (i, path) in modal.path_options.iter().enumerate() {
-                let marker = if modal.path_input_mode == PathInputMode::Presets
-                    && i == modal.selected_path
-                {
+            lines.push(Line::from(format!(
+                "   Current: {}",
+                modal.browser.cwd().display()
+            )));
+            lines.push(Line::from("   Select \"Use <path>\" to launch there."));
+            lines.push(Line::from(""));
+
+            for (i, entry) in modal.browser.entries().iter().enumerate() {
+                let marker = if i == modal.browser.selected() {
                     ">"
                 } else {
                     " "
                 };
-                lines.push(Line::from(format!("{} {}", marker, path)));
+                let icon = match entry.kind {
+                    EntryKind::SelectCurrent => "[use]",
+                    EntryKind::Parent => "[..]",
+                    EntryKind::Directory => "[dir]",
+                };
+                lines.push(Line::from(format!("{} {} {}", marker, icon, entry.label)));
             }
 
             lines.push(Line::from(""));
-            let custom_prefix = if modal.path_input_mode == PathInputMode::Custom {
-                ">"
-            } else {
-                " "
-            };
-            let custom_value = if modal.custom_path.is_empty() {
-                "(type a path)".to_owned()
-            } else {
-                modal.custom_path.clone()
-            };
-            lines.push(Line::from(format!(
-                "{} Custom: {}",
-                custom_prefix, custom_value
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(
-                "enter create   tab toggle field   h back   esc cancel",
-            ));
+            lines.push(Line::from("enter open/select   h back   esc cancel"));
         }
     }
 
     let panel = Paragraph::new(Text::from(lines))
+        .style(Style::default().fg(theme.text).bg(theme.panel_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" New Instance Wizard ")
-                .border_style(Style::default().fg(Color::Yellow)),
+                .title(" Spawn Wizard ")
+                .border_set(border::ROUNDED)
+                .style(Style::default().bg(theme.panel_bg))
+                .border_style(Style::default().fg(theme.accent)),
         )
         .wrap(Wrap { trim: false });
 
     frame.render_widget(panel, area);
 }
 
-fn default_working_paths() -> Vec<String> {
-    let mut paths = Vec::<String>::new();
-
-    if let Ok(cwd) = env::current_dir() {
-        push_unique_path(&mut paths, cwd);
-    }
-
-    if let Some(home) = env::var_os("HOME") {
-        push_unique_path(&mut paths, PathBuf::from(home));
-    }
-
-    push_unique_path(&mut paths, PathBuf::from("/tmp"));
-    push_unique_path(&mut paths, PathBuf::from("/"));
-
-    if paths.is_empty() {
-        paths.push(".".to_owned());
-    }
-
-    paths
-}
-
-fn push_unique_path(paths: &mut Vec<String>, path: PathBuf) {
-    let as_str = path.to_string_lossy().to_string();
-    if !paths.contains(&as_str) {
-        paths.push(as_str);
-    }
+fn panel_block<'a>(title: &'a str, theme: UiTheme) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_set(border::ROUNDED)
+        .style(Style::default().bg(theme.panel_bg))
+        .border_style(Style::default().fg(theme.border))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

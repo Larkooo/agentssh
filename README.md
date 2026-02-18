@@ -6,7 +6,7 @@ The design is inspired by the `terminal.shop` terminal experience:
 - top tab bar
 - dashboard + per-instance tabs
 - keyboard-first controls
-- boxed terminal panels
+- clean boxed panels with modern color theme
 
 ## Architecture
 
@@ -20,8 +20,10 @@ The design is inspired by the `terminal.shop` terminal experience:
 
 - Auto-detects installed agent CLIs in `PATH` (currently: `codex`, `claude`, `aider`, `gemini`, `opencode`)
 - Detects running agent sessions from tmux
-- Creates new agent instances from inside the list view (`[+ New Instance]`)
-- Uses a two-step wizard for creation: choose agent, then choose working directory (preset or custom)
+- Creates new agent instances from inside the list view (`New Instance`)
+- Uses a two-step wizard for creation:
+  - choose agent
+  - navigate filesystem (`..` included) and choose exact working directory
 - Shows an agent dashboard list + summary panel
 - Shows each running instance as its own top tab
 - Attaches into an instance (`enter`)
@@ -44,8 +46,8 @@ cargo build --release
 3. Inside the app:
 
 - go to the dashboard tab
-- select `[+ New Instance]` in the list and press `enter`
-- choose agent, then choose working directory, then press `enter` to create
+- select `New Instance` in the list and press `enter`
+- choose agent, then navigate folders (`..`, directories, and `Use <path>`) and press `enter` to create
 - select an instance and press `enter` to jump in
 - detach from tmux normally (`Ctrl-b d`) and return to the manager
 
@@ -77,8 +79,11 @@ ssh agentops@your-vps
 
 ## Controls
 
-- `up/down` (or `j/k`): move selection in dashboard list
-- `enter` on `[+ New Instance]`: start creation wizard
+- `up/down` (or `j/k`): move selection in lists
+- `enter` on `New Instance`: start creation wizard
+- `enter` in path step:
+  - on `Use <path>`: create instance in that directory
+  - on `..` or a directory: navigate
 - `enter` on an instance: attach to selected/current instance
 - `left/right` (or `h/l`, `tab`): switch tabs
 - `x`: stop selected/current instance
