@@ -20,7 +20,8 @@ The design is inspired by the `terminal.shop` terminal experience:
 
 - Auto-detects installed agent CLIs in `PATH` (currently: `codex`, `claude`, `aider`, `gemini`, `opencode`)
 - Detects running agent sessions from tmux
-- Creates new agent instances from inside the UI (`n`)
+- Creates new agent instances from inside the list view (`[+ New Instance]`)
+- Uses a two-step wizard for creation: choose agent, then choose working directory (preset or custom)
 - Shows an agent dashboard list + summary panel
 - Shows each running instance as its own top tab
 - Attaches into an instance (`enter`)
@@ -42,7 +43,9 @@ cargo build --release
 
 3. Inside the app:
 
-- press `n` to create a new agent instance
+- go to the dashboard tab
+- select `[+ New Instance]` in the list and press `enter`
+- choose agent, then choose working directory, then press `enter` to create
 - select an instance and press `enter` to jump in
 - detach from tmux normally (`Ctrl-b d`) and return to the manager
 
@@ -74,12 +77,11 @@ ssh agentops@your-vps
 
 ## Controls
 
-- `h` / `l` or left/right: switch tabs
-- `j` / `k` or up/down: move selection in dashboard list
-- `n`: new instance modal
-- `enter`: attach to selected/current instance
+- `up/down` (or `j/k`): move selection in dashboard list
+- `enter` on `[+ New Instance]`: start creation wizard
+- `enter` on an instance: attach to selected/current instance
+- `left/right` (or `h/l`, `tab`): switch tabs
 - `x`: stop selected/current instance
 - `d`: go to dashboard tab
 - `r`: refresh
 - `q`: quit
-
