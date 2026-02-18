@@ -7,6 +7,7 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
     SelectCurrent,
+    CreateDirectory,
     Parent,
     Directory,
 }
@@ -28,6 +29,7 @@ pub struct Browser {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivateResult {
     Selected(PathBuf),
+    StartCreateDirectory,
     ChangedDirectory,
 }
 
@@ -81,12 +83,32 @@ impl Browser {
 
         match entry.kind {
             EntryKind::SelectCurrent => Ok(ActivateResult::Selected(self.cwd.clone())),
+            EntryKind::CreateDirectory => Ok(ActivateResult::StartCreateDirectory),
             EntryKind::Parent | EntryKind::Directory => {
                 self.cwd = entry.path;
                 self.refresh()?;
                 Ok(ActivateResult::ChangedDirectory)
             }
         }
+    }
+
+    pub fn create_directory(&mut self, name: &str) -> Result<PathBuf> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow::anyhow!("directory name cannot be empty"));
+        }
+        if trimmed.contains('/') || trimmed.contains('\\') {
+            return Err(anyhow::anyhow!(
+                "directory name must be a single path segment"
+            ));
+        }
+
+        let new_path = self.cwd.join(trimmed);
+        fs::create_dir_all(&new_path)
+            .with_context(|| format!("failed creating directory {}", new_path.display()))?;
+        self.cwd = new_path.clone();
+        self.refresh()?;
+        Ok(new_path)
     }
 
     pub fn refresh(&mut self) -> Result<()> {
@@ -110,6 +132,11 @@ impl Browser {
         entries.push(Entry {
             kind: EntryKind::SelectCurrent,
             label: format!("Use {}", self.cwd.display()),
+            path: self.cwd.clone(),
+        });
+        entries.push(Entry {
+            kind: EntryKind::CreateDirectory,
+            label: "Create directory here...".to_owned(),
             path: self.cwd.clone(),
         });
 
@@ -158,6 +185,7 @@ mod tests {
         let browser = Browser::new(root.clone()).expect("browser create");
 
         assert_eq!(browser.entries[0].kind, EntryKind::SelectCurrent);
+        assert_eq!(browser.entries[1].kind, EntryKind::CreateDirectory);
         assert!(browser.entries.iter().any(|e| e.label == ".."));
         assert!(browser.entries.iter().any(|e| e.label == "child_a"));
         assert!(browser.entries.iter().any(|e| e.label == "child_b"));
@@ -191,6 +219,28 @@ mod tests {
         let result = browser.activate_selected().expect("activate parent");
         assert_eq!(result, ActivateResult::ChangedDirectory);
         assert_eq!(browser.cwd(), root.as_path());
+
+        fs::remove_dir_all(root).expect("cleanup root");
+    }
+
+    #[test]
+    fn create_directory_moves_into_new_path() {
+        let root = std::env::temp_dir().join(format!(
+            "agentssh-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create root");
+
+        let mut browser = Browser::new(root.clone()).expect("browser create");
+        let created = browser
+            .create_directory("new_workspace")
+            .expect("create dir");
+
+        assert_eq!(created, root.join("new_workspace"));
+        assert_eq!(browser.cwd(), root.join("new_workspace").as_path());
 
         fs::remove_dir_all(root).expect("cleanup root");
     }

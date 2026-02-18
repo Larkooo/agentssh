@@ -16,9 +16,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols::border,
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
 };
 use std::{
     env,
@@ -44,6 +43,7 @@ struct AgentInstance {
 enum SpawnStep {
     Agent,
     Path,
+    NewDirectoryName,
 }
 
 #[derive(Debug, Clone)]
@@ -51,31 +51,38 @@ struct SpawnModal {
     step: SpawnStep,
     selected_agent: usize,
     browser: Browser,
+    new_dir_name: String,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct UiTheme {
     bg: Color,
+    chrome_bg: Color,
     panel_bg: Color,
     border: Color,
     text: Color,
     muted: Color,
     accent: Color,
-    success: Color,
-    warning: Color,
+    highlight_bg: Color,
+    red: Color,
+    yellow: Color,
+    green: Color,
 }
 
 impl UiTheme {
     fn new() -> Self {
         Self {
-            bg: Color::Rgb(12, 16, 24),
-            panel_bg: Color::Rgb(20, 26, 38),
-            border: Color::Rgb(67, 86, 113),
-            text: Color::Rgb(222, 231, 243),
-            muted: Color::Rgb(149, 163, 186),
-            accent: Color::Rgb(120, 205, 255),
-            success: Color::Rgb(126, 231, 135),
-            warning: Color::Rgb(255, 214, 117),
+            bg: Color::Rgb(5, 6, 9),
+            chrome_bg: Color::Rgb(14, 16, 20),
+            panel_bg: Color::Rgb(17, 20, 24),
+            border: Color::Rgb(58, 64, 74),
+            text: Color::Rgb(220, 226, 235),
+            muted: Color::Rgb(138, 146, 160),
+            accent: Color::Rgb(41, 227, 223),
+            highlight_bg: Color::Rgb(41, 227, 223),
+            red: Color::Rgb(255, 95, 86),
+            yellow: Color::Rgb(255, 189, 46),
+            green: Color::Rgb(39, 201, 63),
         }
     }
 }
@@ -104,7 +111,7 @@ impl App {
             last_refresh: Instant::now() - refresh_interval,
             refresh_interval,
             should_quit: false,
-            status_line: "Select [+ New Instance] and press Enter".to_owned(),
+            status_line: "Select New Instance and press Enter".to_owned(),
             theme: UiTheme::new(),
         }
     }
@@ -136,7 +143,7 @@ impl App {
                 self.clamp_selection();
 
                 self.status_line = format!(
-                    "{} running | {} CLIs detected",
+                    "{} running | {} agent CLIs detected",
                     self.instances.len(),
                     self.available_agents.len()
                 );
@@ -191,10 +198,10 @@ impl App {
 
     fn tab_titles(&self) -> Vec<String> {
         let mut tabs = Vec::with_capacity(self.instances.len() + 1);
-        tabs.push(" Dashboard ".to_owned());
+        tabs.push(" d dashboard ".to_owned());
         for instance in &self.instances {
-            let short = agents::short_instance_name(&instance.session.name);
-            tabs.push(format!(" {}:{} ", instance.agent.id, short));
+            let short = truncate(&agents::short_instance_name(&instance.session.name), 18);
+            tabs.push(format!(" {} {} ", instance.agent.id, short));
         }
         tabs
     }
@@ -250,6 +257,7 @@ impl App {
                     step: SpawnStep::Agent,
                     selected_agent: 0,
                     browser,
+                    new_dir_name: String::new(),
                 });
             }
             Err(err) => {
@@ -381,9 +389,12 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
     enum Action {
         None,
         Close,
-        Create {
+        CreateInstance {
             agent_index: usize,
             working_dir: String,
+        },
+        CreateDirectory {
+            name: String,
         },
     }
 
@@ -417,18 +428,52 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
                 KeyCode::Left | KeyCode::Char('h') => modal.step = SpawnStep::Agent,
                 KeyCode::Char('j') | KeyCode::Down => modal.browser.next(),
                 KeyCode::Char('k') | KeyCode::Up => modal.browser.previous(),
+                KeyCode::PageDown => {
+                    for _ in 0..10 {
+                        modal.browser.next();
+                    }
+                }
+                KeyCode::PageUp => {
+                    for _ in 0..10 {
+                        modal.browser.previous();
+                    }
+                }
                 KeyCode::Enter => match modal.browser.activate_selected() {
                     Ok(ActivateResult::Selected(path)) => {
-                        action = Action::Create {
+                        action = Action::CreateInstance {
                             agent_index: modal.selected_agent,
                             working_dir: path.to_string_lossy().to_string(),
-                        };
+                        }
                     }
                     Ok(ActivateResult::ChangedDirectory) => {}
+                    Ok(ActivateResult::StartCreateDirectory) => {
+                        modal.step = SpawnStep::NewDirectoryName;
+                        modal.new_dir_name.clear();
+                    }
                     Err(err) => {
                         status_override = Some(format!("Path navigation failed: {err}"));
                     }
                 },
+                _ => {}
+            },
+            SpawnStep::NewDirectoryName => match code {
+                KeyCode::Esc => {
+                    modal.step = SpawnStep::Path;
+                    modal.new_dir_name.clear();
+                }
+                KeyCode::Enter => {
+                    action = Action::CreateDirectory {
+                        name: modal.new_dir_name.clone(),
+                    }
+                }
+                KeyCode::Backspace => {
+                    modal.new_dir_name.pop();
+                }
+                KeyCode::Char(c) => {
+                    if !c.is_control() {
+                        modal.new_dir_name.push(c);
+                    }
+                }
                 _ => {}
             },
         }
@@ -441,10 +486,24 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
     match action {
         Action::None => {}
         Action::Close => app.modal = None,
-        Action::Create {
+        Action::CreateInstance {
             agent_index,
             working_dir,
         } => app.create_instance(agent_index, working_dir),
+        Action::CreateDirectory { name } => {
+            if let Some(modal) = app.modal.as_mut() {
+                match modal.browser.create_directory(&name) {
+                    Ok(path) => {
+                        modal.step = SpawnStep::Path;
+                        modal.new_dir_name.clear();
+                        app.status_line = format!("Created {}", path.display());
+                    }
+                    Err(err) => {
+                        app.status_line = format!("Create directory failed: {err}");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -526,61 +585,77 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
         frame.area(),
     );
 
-    let areas = Layout::default()
+    let app_rect = centered_rect(88, 94, frame.area());
+    let chrome = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(theme.chrome_bg))
+        .border_style(Style::default().fg(theme.border));
+    let inner = chrome.inner(app_rect);
+    frame.render_widget(chrome, app_rect);
+
+    let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(3),
-            Constraint::Min(12),
-            Constraint::Length(4),
+            Constraint::Min(10),
+            Constraint::Length(1),
+            Constraint::Length(2),
         ])
-        .split(frame.area());
+        .split(inner);
 
-    draw_tabs(frame, areas[0], app);
+    draw_title_bar(frame, sections[0], app);
+    draw_tabs(frame, sections[1], app);
 
     if app.selected_tab == 0 {
-        draw_dashboard(frame, areas[1], app);
+        draw_dashboard(frame, sections[2], app);
     } else {
-        draw_instance_tab(frame, areas[1], app);
+        draw_instance_tab(frame, sections[2], app);
     }
 
-    draw_footer(frame, areas[2], app);
+    draw_status_line(frame, sections[3], app);
+    draw_footer(frame, sections[4], app);
 
     if app.modal.is_some() {
         draw_spawn_modal(frame, app);
     }
 }
 
-fn draw_tabs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let theme = app.theme;
-    let titles = app.tab_titles();
+fn draw_title_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let t = app.theme;
+    let line = Line::from(vec![
+        Span::styled("o", Style::default().fg(t.red)),
+        Span::raw(" "),
+        Span::styled("o", Style::default().fg(t.yellow)),
+        Span::raw(" "),
+        Span::styled("o", Style::default().fg(t.green)),
+        Span::styled("  [dir] ssh agentssh", Style::default().fg(t.muted)),
+    ]);
 
-    let tabs = Tabs::new(titles)
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(t.chrome_bg)),
+        area,
+    );
+}
+
+fn draw_tabs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let t = app.theme;
+    let tabs = Tabs::new(app.tab_titles())
         .select(app.selected_tab)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(Line::from(vec![
-                    Span::styled(
-                        " agentssh ",
-                        Style::default()
-                            .fg(theme.bg)
-                            .bg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("  multi-agent runtime", Style::default().fg(theme.muted)),
-                ]))
-                .border_set(border::ROUNDED)
-                .style(Style::default().bg(theme.panel_bg).fg(theme.text))
-                .border_style(Style::default().fg(theme.border)),
+                .style(Style::default().bg(t.panel_bg))
+                .border_style(Style::default().fg(t.border)),
         )
-        .style(Style::default().fg(theme.muted).bg(theme.panel_bg))
+        .style(Style::default().fg(t.muted).bg(t.panel_bg))
         .highlight_style(
             Style::default()
-                .fg(theme.bg)
-                .bg(theme.accent)
+                .fg(t.text)
+                .bg(t.panel_bg)
                 .add_modifier(Modifier::BOLD),
         )
-        .divider(" ");
+        .divider("|");
 
     frame.render_widget(tabs, area);
 }
@@ -588,98 +663,80 @@ fn draw_tabs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
         .split(area);
 
-    draw_instance_table(frame, chunks[0], app);
+    draw_instance_list(frame, chunks[0], app);
     draw_summary_panel(frame, chunks[1], app);
 }
 
-fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let theme = app.theme;
+fn draw_instance_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let t = app.theme;
+    let mut lines = vec![Line::from(Span::styled(
+        "~ instances ~",
+        Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+    ))];
 
-    let mut rows: Vec<Row<'_>> = app
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| {
-            let state = if instance.session.attached {
-                "attached"
-            } else {
-                "idle"
-            };
-            let marker = if instance.managed {
-                "managed"
-            } else {
-                "external"
-            };
-            Row::new(vec![
-                Cell::from(format!("{}", index + 1)),
-                Cell::from(instance.agent.id.clone()),
-                Cell::from(agents::short_instance_name(&instance.session.name)),
-                Cell::from(state),
-                Cell::from(marker),
-                Cell::from(instance.session.last_line.clone()),
-            ])
-            .style(Style::default().fg(theme.text).bg(theme.panel_bg))
-        })
-        .collect();
+    let total = app.dashboard_row_count();
+    let capacity = area.height.saturating_sub(4) as usize;
+    let (start, end) = visible_range(total, app.selected_row, capacity.max(1));
 
-    rows.push(
-        Row::new(vec![
-            Cell::from("+"),
-            Cell::from("action"),
-            Cell::from("New Instance"),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from("Open creation wizard"),
-        ])
-        .style(Style::default().fg(theme.success).bg(theme.panel_bg)),
-    );
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            "...",
+            Style::default().fg(t.muted),
+        )));
+    }
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(4),
-            Constraint::Length(10),
-            Constraint::Length(24),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Min(18),
-        ],
-    )
-    .header(
-        Row::new(vec![
-            "#",
-            "Agent",
-            "Session",
-            "State",
-            "Kind",
-            "Last Output / Action",
-        ])
-        .style(
+    for index in start..end {
+        let selected = index == app.selected_row;
+        let label = if index < app.instances.len() {
+            let instance = &app.instances[index];
+            format!(
+                "{} {}",
+                instance.agent.id,
+                truncate(&agents::short_instance_name(&instance.session.name), 24)
+            )
+        } else {
+            "New Instance".to_owned()
+        };
+
+        let style = if selected {
             Style::default()
-                .fg(theme.accent)
-                .bg(theme.panel_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .row_highlight_style(
-        Style::default()
-            .fg(theme.bg)
-            .bg(theme.warning)
-            .add_modifier(Modifier::BOLD),
-    )
-    .block(panel_block(" Instances ", theme));
+                .fg(t.bg)
+                .bg(t.highlight_bg)
+                .add_modifier(Modifier::BOLD)
+        } else if index == app.instances.len() {
+            Style::default().fg(t.accent)
+        } else {
+            Style::default().fg(t.text)
+        };
 
-    let mut state = TableState::default();
-    state.select(Some(app.selected_row));
+        lines.push(Line::from(Span::styled(format!("{}", label), style)));
+    }
 
-    frame.render_stateful_widget(table, area, &mut state);
+    if end < total {
+        lines.push(Line::from(Span::styled(
+            "...",
+            Style::default().fg(t.muted),
+        )));
+    }
+
+    let panel = Paragraph::new(Text::from(lines))
+        .style(Style::default().bg(t.panel_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.border))
+                .style(Style::default().bg(t.panel_bg)),
+        )
+        .wrap(Wrap { trim: true });
+
+    frame.render_widget(panel, area);
 }
 
 fn draw_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let theme = app.theme;
+    let t = app.theme;
 
     let lines = if app.is_action_row_selected() || app.instances.is_empty() {
         let available = if app.available_agents.is_empty() {
@@ -694,150 +751,215 @@ fn draw_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
         vec![
             Line::from(Span::styled(
-                "Create a new instance",
-                Style::default()
-                    .fg(theme.success)
-                    .add_modifier(Modifier::BOLD),
+                "create new agent instance",
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from("Select New Instance in the list and press Enter."),
-            Line::from("Then choose agent + folder in the wizard."),
+            Line::from("1. select New Instance on the left"),
+            Line::from("2. choose agent"),
+            Line::from("3. navigate folder and select Use <path>"),
+            Line::from("4. attach when ready"),
             Line::from(""),
-            Line::from("Detected CLIs:"),
-            Line::from(available),
+            Line::from(format!("detected: {available}")),
         ]
     } else if let Some(instance) = app.selected_instance() {
         let mut lines = vec![
-            Line::from(format!("Agent: {}", instance.agent.label)),
-            Line::from(format!("Binary: {}", instance.agent.binary)),
-            Line::from(format!("Session: {}", instance.session.name)),
-            Line::from(format!("Created: {}", instance.session.created)),
-            Line::from(format!("Command: {}", instance.session.current_command)),
+            Line::from(Span::styled(
+                instance.agent.label.clone(),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("session: {}", instance.session.name)),
+            Line::from(format!("created: {}", instance.session.created)),
+            Line::from(format!(
+                "state: {}",
+                if instance.session.attached {
+                    "attached"
+                } else {
+                    "idle"
+                }
+            )),
+            Line::from(format!(
+                "kind: {}",
+                if instance.managed {
+                    "managed"
+                } else {
+                    "external"
+                }
+            )),
+            Line::from(format!("cmd: {}", instance.session.current_command)),
             Line::from(""),
-            Line::from("Recent output:"),
         ];
 
-        if instance.session.preview.is_empty() {
+        let preview_space = area.height.saturating_sub(lines.len() as u16 + 3) as usize;
+        let preview_take = preview_space.max(4);
+        let preview = instance
+            .session
+            .preview
+            .iter()
+            .rev()
+            .take(preview_take)
+            .cloned()
+            .collect::<Vec<String>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<String>>();
+
+        if preview.is_empty() {
             lines.push(Line::from("(no output captured)"));
         } else {
-            let tail = instance
-                .session
-                .preview
-                .iter()
-                .rev()
-                .take(12)
-                .cloned()
-                .collect::<Vec<String>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<String>>();
-
-            for line in tail {
+            for line in preview {
                 lines.push(Line::from(line));
             }
         }
 
         lines
     } else {
-        vec![Line::from("Select an instance")]
+        vec![Line::from("select an instance")]
     };
 
-    let panel = Paragraph::new(Text::from(lines))
-        .style(Style::default().fg(theme.text).bg(theme.panel_bg))
-        .block(panel_block(" Summary ", theme))
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(panel, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().fg(t.text).bg(t.panel_bg))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(t.border))
+                    .style(Style::default().bg(t.panel_bg)),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_instance_tab(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let theme = app.theme;
-
+    let t = app.theme;
     let Some(instance) = app.current_tab_instance() else {
         draw_dashboard(frame, area, app);
         return;
     };
 
-    let chunks = Layout::default()
+    let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(8)])
+        .constraints([Constraint::Length(7), Constraint::Min(8)])
         .split(area);
 
     let details = Paragraph::new(Text::from(vec![
-        Line::from(format!(
-            "Agent: {} ({})",
-            instance.agent.label, instance.agent.binary
+        Line::from(Span::styled(
+            format!("{} ({})", instance.agent.label, instance.agent.binary),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         )),
-        Line::from(format!("Session: {}", instance.session.name)),
-        Line::from(format!("Created: {}", instance.session.created)),
-        Line::from(format!(
-            "State: {} | Windows: {} | Kind: {}",
-            if instance.session.attached {
-                "attached"
-            } else {
-                "idle"
-            },
-            instance.session.windows,
-            if instance.managed {
-                "managed"
-            } else {
-                "external"
-            }
-        )),
-        Line::from(format!("Command: {}", instance.session.current_command)),
+        Line::from(format!("session: {}", instance.session.name)),
+        Line::from(format!("created: {}", instance.session.created)),
+        Line::from(format!("windows: {}", instance.session.windows)),
+        Line::from(format!("command: {}", instance.session.current_command)),
     ]))
-    .style(Style::default().fg(theme.text).bg(theme.panel_bg))
-    .block(panel_block(" Instance ", theme))
-    .wrap(Wrap { trim: false });
+    .style(Style::default().fg(t.text).bg(t.panel_bg))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.border))
+            .style(Style::default().bg(t.panel_bg)),
+    );
 
-    let preview = if instance.session.preview.is_empty() {
+    let preview_take = sections[1].height.saturating_sub(2) as usize;
+    let preview = instance
+        .session
+        .preview
+        .iter()
+        .rev()
+        .take(preview_take.max(4))
+        .cloned()
+        .collect::<Vec<String>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<String>>();
+
+    let preview_lines = if preview.is_empty() {
         vec![Line::from("(no output captured)")]
     } else {
-        instance
-            .session
-            .preview
-            .iter()
-            .map(|line| Line::from(line.clone()))
+        preview
+            .into_iter()
+            .map(Line::from)
             .collect::<Vec<Line<'_>>>()
     };
 
-    let preview_panel = Paragraph::new(Text::from(preview))
-        .style(Style::default().fg(theme.text).bg(theme.panel_bg))
-        .block(panel_block(" Live Buffer ", theme))
+    let preview_panel = Paragraph::new(Text::from(preview_lines))
+        .style(Style::default().fg(t.text).bg(t.panel_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" live buffer ")
+                .border_style(Style::default().fg(t.border))
+                .style(Style::default().bg(t.panel_bg)),
+        )
         .wrap(Wrap { trim: false });
 
-    frame.render_widget(details, chunks[0]);
-    frame.render_widget(preview_panel, chunks[1]);
+    frame.render_widget(details, sections[0]);
+    frame.render_widget(preview_panel, sections[1]);
+}
+
+fn draw_status_line(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let t = app.theme;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("status: ", Style::default().fg(t.muted)),
+            Span::styled(app.status_line.clone(), Style::default().fg(t.text)),
+        ]))
+        .style(Style::default().bg(t.chrome_bg)),
+        area,
+    );
 }
 
 fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let theme = app.theme;
-
+    let t = app.theme;
     let commands = Line::from(vec![
-        Span::styled("arrows + enter", Style::default().fg(theme.warning)),
-        Span::styled(" to navigate and open.", Style::default().fg(theme.text)),
-        Span::styled("  tab/left/right", Style::default().fg(theme.warning)),
-        Span::styled(" for tabs.", Style::default().fg(theme.text)),
+        Span::styled(
+            "up/down",
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" select   ", Style::default().fg(t.muted)),
+        Span::styled(
+            "enter",
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" open/attach   ", Style::default().fg(t.muted)),
+        Span::styled(
+            "left/right",
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" tabs   ", Style::default().fg(t.muted)),
+        Span::styled(
+            "x",
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" stop   ", Style::default().fg(t.muted)),
+        Span::styled(
+            "q",
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" quit", Style::default().fg(t.muted)),
     ]);
 
-    let panel = Paragraph::new(Text::from(vec![
-        commands,
-        Line::from(app.status_line.clone()),
-    ]))
-    .style(Style::default().fg(theme.text).bg(theme.panel_bg))
-    .block(panel_block(" Controls ", theme))
-    .wrap(Wrap { trim: false });
-
-    frame.render_widget(panel, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![commands]))
+            .style(Style::default().bg(t.chrome_bg))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(t.border))
+                    .style(Style::default().bg(t.chrome_bg)),
+            ),
+        area,
+    );
 }
 
 fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let theme = app.theme;
+    let t = app.theme;
     let Some(modal) = app.modal.as_ref() else {
         return;
     };
 
-    let area = centered_rect(72, 74, frame.area());
+    let area = centered_rect(74, 78, frame.area());
     frame.render_widget(Clear, area);
 
     let selected_agent = app
@@ -848,14 +970,12 @@ fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     let mut lines = vec![
         Line::from(Span::styled(
-            "Create New Instance",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
+            "new instance wizard",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(format!(
-            "1) Agent [{}]",
+            "1) agent [{}]",
             if modal.step == SpawnStep::Agent {
                 "active"
             } else {
@@ -865,7 +985,7 @@ fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
         Line::from(format!("   {}", selected_agent)),
         Line::from(""),
         Line::from(format!(
-            "2) Working Directory [{}]",
+            "2) path [{}]",
             if modal.step == SpawnStep::Path {
                 "active"
             } else {
@@ -876,65 +996,160 @@ fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     match modal.step {
         SpawnStep::Agent => {
-            for (i, agent) in app.available_agents.iter().enumerate() {
-                let marker = if i == modal.selected_agent { ">" } else { " " };
-                lines.push(Line::from(format!(
-                    "{} {} ({})",
-                    marker, agent.label, agent.binary
+            let capacity = area.height.saturating_sub(11) as usize;
+            let (start, end) = visible_range(
+                app.available_agents.len(),
+                modal.selected_agent,
+                capacity.max(1),
+            );
+            if start > 0 {
+                lines.push(Line::from("..."));
+            }
+
+            for i in start..end {
+                let agent = &app.available_agents[i];
+                let selected = i == modal.selected_agent;
+                let style = if selected {
+                    Style::default()
+                        .fg(t.bg)
+                        .bg(t.highlight_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(t.text)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{} ({})", agent.label, agent.binary),
+                    style,
                 )));
             }
+
+            if end < app.available_agents.len() {
+                lines.push(Line::from("..."));
+            }
+
             lines.push(Line::from(""));
             lines.push(Line::from("enter next   esc cancel   up/down move"));
         }
         SpawnStep::Path => {
             lines.push(Line::from(format!(
-                "   Current: {}",
+                "   cwd: {}",
                 modal.browser.cwd().display()
             )));
-            lines.push(Line::from("   Select \"Use <path>\" to launch there."));
             lines.push(Line::from(""));
 
-            for (i, entry) in modal.browser.entries().iter().enumerate() {
-                let marker = if i == modal.browser.selected() {
-                    ">"
-                } else {
-                    " "
-                };
+            let entries = modal.browser.entries();
+            let capacity = area.height.saturating_sub(12) as usize;
+            let (start, end) =
+                visible_range(entries.len(), modal.browser.selected(), capacity.max(1));
+
+            if start > 0 {
+                lines.push(Line::from(Span::styled(
+                    "...",
+                    Style::default().fg(t.muted),
+                )));
+            }
+
+            for (i, entry) in entries.iter().enumerate().skip(start).take(end - start) {
                 let icon = match entry.kind {
                     EntryKind::SelectCurrent => "[use]",
+                    EntryKind::CreateDirectory => "[new]",
                     EntryKind::Parent => "[..]",
                     EntryKind::Directory => "[dir]",
                 };
-                lines.push(Line::from(format!("{} {} {}", marker, icon, entry.label)));
+
+                let style = if i == modal.browser.selected() {
+                    Style::default()
+                        .fg(t.bg)
+                        .bg(t.highlight_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else if matches!(entry.kind, EntryKind::CreateDirectory) {
+                    Style::default().fg(t.accent)
+                } else {
+                    Style::default().fg(t.text)
+                };
+
+                lines.push(Line::from(Span::styled(
+                    format!("{} {}", icon, entry.label),
+                    style,
+                )));
+            }
+
+            if end < entries.len() {
+                lines.push(Line::from(Span::styled(
+                    "...",
+                    Style::default().fg(t.muted),
+                )));
             }
 
             lines.push(Line::from(""));
-            lines.push(Line::from("enter open/select   h back   esc cancel"));
+            lines.push(Line::from(
+                "enter open/select   pgup/pgdn scroll   h back   esc cancel",
+            ));
+        }
+        SpawnStep::NewDirectoryName => {
+            lines.push(Line::from(format!(
+                "   cwd: {}",
+                modal.browser.cwd().display()
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("new directory name:"));
+            lines.push(Line::from(Span::styled(
+                if modal.new_dir_name.is_empty() {
+                    "_".to_owned()
+                } else {
+                    format!("{}_", modal.new_dir_name)
+                },
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("enter create   esc back   type to set name"));
         }
     }
 
-    let panel = Paragraph::new(Text::from(lines))
-        .style(Style::default().fg(theme.text).bg(theme.panel_bg))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Spawn Wizard ")
-                .border_set(border::ROUNDED)
-                .style(Style::default().bg(theme.panel_bg))
-                .border_style(Style::default().fg(theme.accent)),
-        )
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(panel, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().fg(t.text).bg(t.panel_bg))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" spawn ")
+                    .border_style(Style::default().fg(t.accent))
+                    .style(Style::default().bg(t.panel_bg)),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
-fn panel_block<'a>(title: &'a str, theme: UiTheme) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_set(border::ROUNDED)
-        .style(Style::default().bg(theme.panel_bg))
-        .border_style(Style::default().fg(theme.border))
+fn visible_range(total: usize, selected: usize, capacity: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    if total <= capacity {
+        return (0, total);
+    }
+
+    let half = capacity / 2;
+    let mut start = selected.saturating_sub(half);
+    let max_start = total.saturating_sub(capacity);
+    if start > max_start {
+        start = max_start;
+    }
+
+    (start, (start + capacity).min(total))
+}
+
+fn truncate(input: &str, max: usize) -> String {
+    if input.chars().count() <= max {
+        return input.to_owned();
+    }
+
+    let mut out = input
+        .chars()
+        .take(max.saturating_sub(1))
+        .collect::<String>();
+    out.push('~');
+    out
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
