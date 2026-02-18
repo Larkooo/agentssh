@@ -115,6 +115,10 @@ pub fn build_managed_session_name(agent_id: &str) -> String {
     format!("agentssh.{agent_id}.{ts}")
 }
 
+pub fn build_launch_command(working_dir: &str, launch: &str) -> String {
+    format!("cd {} && exec {}", shell_quote(working_dir), launch)
+}
+
 pub fn short_instance_name(session_name: &str) -> String {
     if let Some((agent, suffix)) = split_managed_session_name(session_name) {
         return format!("{agent}.{suffix}");
@@ -151,6 +155,13 @@ fn command_binary(command: &str) -> Option<String> {
 
 fn binary_matches(actual: &str, expected: &str) -> bool {
     actual == expected || actual.starts_with(&format!("{expected}."))
+}
+
+fn shell_quote(input: &str) -> String {
+    if input.is_empty() {
+        return "''".to_owned();
+    }
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
 fn command_exists(binary: &str) -> bool {
@@ -234,5 +245,11 @@ mod tests {
             .expect("codex command should be classified");
 
         assert_eq!(found.id, "codex");
+    }
+
+    #[test]
+    fn build_launch_command_quotes_working_directory() {
+        let command = build_launch_command("/tmp/my dir/it's", "codex");
+        assert_eq!(command, "cd '/tmp/my dir/it'\"'\"'s' && exec codex");
     }
 }

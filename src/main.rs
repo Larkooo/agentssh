@@ -18,7 +18,9 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 use std::{
+    env,
     io::{self, Stdout},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -36,9 +38,39 @@ struct AgentInstance {
     managed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnStep {
+    Agent,
+    Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathInputMode {
+    Presets,
+    Custom,
+}
+
 #[derive(Debug, Clone)]
-struct NewInstanceModal {
+struct SpawnModal {
+    step: SpawnStep,
     selected_agent: usize,
+    selected_path: usize,
+    path_input_mode: PathInputMode,
+    custom_path: String,
+    path_options: Vec<String>,
+}
+
+impl SpawnModal {
+    fn selected_working_dir(&self) -> Option<String> {
+        if self.path_input_mode == PathInputMode::Custom {
+            let custom = self.custom_path.trim();
+            if !custom.is_empty() {
+                return Some(custom.to_owned());
+            }
+        }
+
+        self.path_options.get(self.selected_path).cloned()
+    }
 }
 
 struct App {
@@ -46,7 +78,7 @@ struct App {
     instances: Vec<AgentInstance>,
     selected_row: usize,
     selected_tab: usize,
-    modal: Option<NewInstanceModal>,
+    modal: Option<SpawnModal>,
     last_refresh: Instant,
     refresh_interval: Duration,
     should_quit: bool,
@@ -64,7 +96,7 @@ impl App {
             last_refresh: Instant::now() - refresh_interval,
             refresh_interval,
             should_quit: false,
-            status_line: "Press n to start a new agent instance".to_owned(),
+            status_line: "Select [+ New Instance] and press Enter".to_owned(),
         }
     }
 
@@ -111,25 +143,30 @@ impl App {
         self.last_refresh = Instant::now();
     }
 
+    fn dashboard_row_count(&self) -> usize {
+        self.instances.len() + 1
+    }
+
     fn clamp_selection(&mut self) {
-        if self.instances.is_empty() {
-            self.selected_row = 0;
-            self.selected_tab = 0;
-            return;
+        if self.selected_row >= self.dashboard_row_count() {
+            self.selected_row = self.dashboard_row_count().saturating_sub(1);
         }
 
-        if self.selected_row >= self.instances.len() {
-            self.selected_row = self.instances.len() - 1;
+        if self.selected_tab > self.instances.len() {
+            self.selected_tab = 0;
         }
 
-        let max_tab = self.instances.len();
-        if self.selected_tab > max_tab {
-            self.selected_tab = 0;
+        if self.selected_tab > 0 {
+            self.selected_row = self.selected_tab - 1;
         }
     }
 
     fn selected_instance(&self) -> Option<&AgentInstance> {
-        self.instances.get(self.selected_row)
+        if self.selected_row < self.instances.len() {
+            self.instances.get(self.selected_row)
+        } else {
+            None
+        }
     }
 
     fn current_tab_instance(&self) -> Option<&AgentInstance> {
@@ -137,6 +174,10 @@ impl App {
             return None;
         }
         self.instances.get(self.selected_tab - 1)
+    }
+
+    fn is_action_row_selected(&self) -> bool {
+        self.selected_tab == 0 && self.selected_row == self.instances.len()
     }
 
     fn tab_titles(&self) -> Vec<String> {
@@ -150,18 +191,14 @@ impl App {
     }
 
     fn next_row(&mut self) {
-        if self.instances.is_empty() {
-            return;
-        }
-        self.selected_row = (self.selected_row + 1) % self.instances.len();
+        let count = self.dashboard_row_count();
+        self.selected_row = (self.selected_row + 1) % count;
     }
 
     fn previous_row(&mut self) {
-        if self.instances.is_empty() {
-            return;
-        }
+        let count = self.dashboard_row_count();
         if self.selected_row == 0 {
-            self.selected_row = self.instances.len() - 1;
+            self.selected_row = count.saturating_sub(1);
         } else {
             self.selected_row -= 1;
         }
@@ -196,7 +233,15 @@ impl App {
             self.status_line = "No supported agent CLIs found in PATH".to_owned();
             return;
         }
-        self.modal = Some(NewInstanceModal { selected_agent: 0 });
+
+        self.modal = Some(SpawnModal {
+            step: SpawnStep::Agent,
+            selected_agent: 0,
+            selected_path: 0,
+            path_input_mode: PathInputMode::Presets,
+            custom_path: String::new(),
+            path_options: default_working_paths(),
+        });
     }
 
     fn create_instance_from_modal(&mut self) {
@@ -204,16 +249,23 @@ impl App {
             return;
         };
 
-        let Some(agent) = self.available_agents.get(modal.selected_agent) else {
+        let Some(agent) = self.available_agents.get(modal.selected_agent).cloned() else {
             self.status_line = "Invalid agent selection".to_owned();
             self.modal = None;
             return;
         };
 
+        let Some(working_dir) = modal.selected_working_dir() else {
+            self.status_line = "Select or type a working directory first".to_owned();
+            return;
+        };
+
+        let launch_command = agents::build_launch_command(&working_dir, &agent.launch);
         let session_name = agents::build_managed_session_name(&agent.id);
-        match tmux::create_session(&session_name, &agent.launch) {
+
+        match tmux::create_session(&session_name, &launch_command) {
             Ok(()) => {
-                self.status_line = format!("Started {} in {}", agent.label, session_name);
+                self.status_line = format!("Started {} in {}", agent.label, working_dir);
                 self.modal = None;
                 self.refresh();
 
@@ -235,7 +287,7 @@ impl App {
 
     fn kill_selected_instance(&mut self) {
         let Some(instance) = self.active_instance_ref().cloned() else {
-            self.status_line = "No instance selected".to_owned();
+            self.status_line = "Select an instance row first".to_owned();
             return;
         };
 
@@ -321,30 +373,84 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
 }
 
 fn handle_modal_key(app: &mut App, code: KeyCode) {
-    let Some(modal) = app.modal.as_mut() else {
-        return;
-    };
+    enum Action {
+        None,
+        Close,
+        Create,
+    }
 
-    match code {
-        KeyCode::Esc => app.modal = None,
-        KeyCode::Char('j') | KeyCode::Down => {
-            if app.available_agents.is_empty() {
-                return;
-            }
-            modal.selected_agent = (modal.selected_agent + 1) % app.available_agents.len();
+    let mut action = Action::None;
+
+    if let Some(modal) = app.modal.as_mut() {
+        match modal.step {
+            SpawnStep::Agent => match code {
+                KeyCode::Esc => action = Action::Close,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if app.available_agents.is_empty() {
+                        return;
+                    }
+                    modal.selected_agent = (modal.selected_agent + 1) % app.available_agents.len();
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if app.available_agents.is_empty() {
+                        return;
+                    }
+                    if modal.selected_agent == 0 {
+                        modal.selected_agent = app.available_agents.len() - 1;
+                    } else {
+                        modal.selected_agent -= 1;
+                    }
+                }
+                KeyCode::Enter => modal.step = SpawnStep::Path,
+                _ => {}
+            },
+            SpawnStep::Path => match code {
+                KeyCode::Esc => action = Action::Close,
+                KeyCode::Left | KeyCode::Char('h') => modal.step = SpawnStep::Agent,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    modal.path_input_mode = match modal.path_input_mode {
+                        PathInputMode::Presets => PathInputMode::Custom,
+                        PathInputMode::Custom => PathInputMode::Presets,
+                    }
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if modal.path_input_mode == PathInputMode::Presets
+                        && !modal.path_options.is_empty()
+                    {
+                        modal.selected_path = (modal.selected_path + 1) % modal.path_options.len();
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if modal.path_input_mode == PathInputMode::Presets
+                        && !modal.path_options.is_empty()
+                    {
+                        if modal.selected_path == 0 {
+                            modal.selected_path = modal.path_options.len() - 1;
+                        } else {
+                            modal.selected_path -= 1;
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    if modal.path_input_mode == PathInputMode::Custom {
+                        modal.custom_path.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if modal.path_input_mode == PathInputMode::Custom {
+                        modal.custom_path.push(c);
+                    }
+                }
+                KeyCode::Enter => action = Action::Create,
+                _ => {}
+            },
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if app.available_agents.is_empty() {
-                return;
-            }
-            if modal.selected_agent == 0 {
-                modal.selected_agent = app.available_agents.len() - 1;
-            } else {
-                modal.selected_agent -= 1;
-            }
-        }
-        KeyCode::Enter => app.create_instance_from_modal(),
-        _ => {}
+    }
+
+    match action {
+        Action::None => {}
+        Action::Close => app.modal = None,
+        Action::Create => app.create_instance_from_modal(),
     }
 }
 
@@ -368,11 +474,13 @@ fn handle_main_key(
         KeyCode::Char('h') | KeyCode::Left => app.previous_tab(),
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => app.next_tab(),
         KeyCode::Char('d') => app.selected_tab = 0,
-        KeyCode::Char('n') => app.open_new_modal(),
         KeyCode::Char('x') => app.kill_selected_instance(),
+        KeyCode::Char('n') => app.open_new_modal(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Enter => {
-            if let Some(instance) = app.active_instance_ref() {
+            if app.selected_tab == 0 && app.is_action_row_selected() {
+                app.open_new_modal();
+            } else if let Some(instance) = app.active_instance_ref() {
                 let attach_result = attach_into_session(terminal, &instance.session.name);
                 match attach_result {
                     Ok(()) => app.status_line = format!("Detached from {}", instance.session.name),
@@ -436,7 +544,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     draw_footer(frame, areas[2], app);
 
     if app.modal.is_some() {
-        draw_new_instance_modal(frame, app);
+        draw_spawn_modal(frame, app);
     }
 }
 
@@ -472,38 +580,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    if app.instances.is_empty() {
-        let available = if app.available_agents.is_empty() {
-            "none".to_owned()
-        } else {
-            app.available_agents
-                .iter()
-                .map(|a| a.label.clone())
-                .collect::<Vec<String>>()
-                .join(", ")
-        };
-
-        let panel = Paragraph::new(Text::from(vec![
-            Line::from("No running agent instances."),
-            Line::from(""),
-            Line::from("Detected agent CLIs:"),
-            Line::from(available),
-            Line::from(""),
-            Line::from("Press n to start a new instance."),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Instances ")
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .wrap(Wrap { trim: false });
-
-        frame.render_widget(panel, area);
-        return;
-    }
-
-    let rows: Vec<Row<'_>> = app
+    let mut rows: Vec<Row<'_>> = app
         .instances
         .iter()
         .enumerate()
@@ -529,6 +606,18 @@ fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         })
         .collect();
 
+    rows.push(
+        Row::new(vec![
+            Cell::from("+"),
+            Cell::from("action"),
+            Cell::from("[+ New Instance]"),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from("Start a new agent session"),
+        ])
+        .style(Style::default().fg(Color::Green)),
+    );
+
     let table = Table::new(
         rows,
         [
@@ -537,7 +626,7 @@ fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Constraint::Length(24),
             Constraint::Length(10),
             Constraint::Length(10),
-            Constraint::Min(20),
+            Constraint::Min(18),
         ],
     )
     .header(
@@ -547,7 +636,7 @@ fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             "Session",
             "State",
             "Kind",
-            "Last Output",
+            "Last Output / Action",
         ])
         .style(
             Style::default()
@@ -574,7 +663,26 @@ fn draw_instance_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let lines = if let Some(instance) = app.selected_instance() {
+    let lines = if app.is_action_row_selected() || app.instances.is_empty() {
+        let available = if app.available_agents.is_empty() {
+            "none".to_owned()
+        } else {
+            app.available_agents
+                .iter()
+                .map(|a| a.label.clone())
+                .collect::<Vec<String>>()
+                .join(", ")
+        };
+
+        vec![
+            Line::from("Create new instance"),
+            Line::from(""),
+            Line::from("Select [+ New Instance] in the list and press Enter."),
+            Line::from(""),
+            Line::from("Detected CLIs:"),
+            Line::from(available),
+        ]
+    } else if let Some(instance) = app.selected_instance() {
         let mut lines = vec![
             Line::from(format!("Agent: {}", instance.agent.label)),
             Line::from(format!("Binary: {}", instance.agent.binary)),
@@ -689,10 +797,11 @@ fn draw_instance_tab(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let commands =
-        "h/l tabs  j/k list  enter attach  n new  x stop  r refresh  d dashboard  q quit";
+    let commands = "Use arrows + Enter. New instance is an action row in the list.";
+    let shortcuts = "Shortcuts: Tab/←/→ tabs  x stop  r refresh  q quit";
     let panel = Paragraph::new(Text::from(vec![
         Line::from(commands),
+        Line::from(shortcuts),
         Line::from(app.status_line.clone()),
     ]))
     .block(
@@ -706,37 +815,128 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(panel, area);
 }
 
-fn draw_new_instance_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
+fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
     let Some(modal) = app.modal.as_ref() else {
         return;
     };
 
-    let area = centered_rect(60, 58, frame.area());
+    let area = centered_rect(70, 65, frame.area());
     frame.render_widget(Clear, area);
 
-    let mut lines = vec![Line::from("Start a new agent instance"), Line::from("")];
+    let selected_agent = app
+        .available_agents
+        .get(modal.selected_agent)
+        .map(|a| format!("{} ({})", a.label, a.binary))
+        .unwrap_or_else(|| "none".to_owned());
 
-    for (i, agent) in app.available_agents.iter().enumerate() {
-        let prefix = if i == modal.selected_agent { ">" } else { " " };
-        lines.push(Line::from(format!(
-            "{} {} ({})",
-            prefix, agent.label, agent.binary
-        )));
+    let mut lines = vec![
+        Line::from("Create a new agent instance"),
+        Line::from(""),
+        Line::from(format!(
+            "1) Agent  [{}]",
+            if modal.step == SpawnStep::Agent {
+                "ACTIVE"
+            } else {
+                "done"
+            }
+        )),
+        Line::from(format!("   Selected: {}", selected_agent)),
+        Line::from(""),
+        Line::from(format!(
+            "2) Working Directory  [{}]",
+            if modal.step == SpawnStep::Path {
+                "ACTIVE"
+            } else {
+                "pending"
+            }
+        )),
+    ];
+
+    match modal.step {
+        SpawnStep::Agent => {
+            for (i, agent) in app.available_agents.iter().enumerate() {
+                let marker = if i == modal.selected_agent { ">" } else { " " };
+                lines.push(Line::from(format!(
+                    "{} {} ({})",
+                    marker, agent.label, agent.binary
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("enter next   esc cancel   ↑/↓ move"));
+        }
+        SpawnStep::Path => {
+            lines.push(Line::from("   Presets:"));
+            for (i, path) in modal.path_options.iter().enumerate() {
+                let marker = if modal.path_input_mode == PathInputMode::Presets
+                    && i == modal.selected_path
+                {
+                    ">"
+                } else {
+                    " "
+                };
+                lines.push(Line::from(format!("{} {}", marker, path)));
+            }
+
+            lines.push(Line::from(""));
+            let custom_prefix = if modal.path_input_mode == PathInputMode::Custom {
+                ">"
+            } else {
+                " "
+            };
+            let custom_value = if modal.custom_path.is_empty() {
+                "(type a path)".to_owned()
+            } else {
+                modal.custom_path.clone()
+            };
+            lines.push(Line::from(format!(
+                "{} Custom: {}",
+                custom_prefix, custom_value
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "enter create   tab toggle field   h back   esc cancel",
+            ));
+        }
     }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from("enter create   esc cancel   j/k move"));
 
     let panel = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" New Instance ")
+                .title(" New Instance Wizard ")
                 .border_style(Style::default().fg(Color::Yellow)),
         )
         .wrap(Wrap { trim: false });
 
     frame.render_widget(panel, area);
+}
+
+fn default_working_paths() -> Vec<String> {
+    let mut paths = Vec::<String>::new();
+
+    if let Ok(cwd) = env::current_dir() {
+        push_unique_path(&mut paths, cwd);
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        push_unique_path(&mut paths, PathBuf::from(home));
+    }
+
+    push_unique_path(&mut paths, PathBuf::from("/tmp"));
+    push_unique_path(&mut paths, PathBuf::from("/"));
+
+    if paths.is_empty() {
+        paths.push(".".to_owned());
+    }
+
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<String>, path: PathBuf) {
+    let as_str = path.to_string_lossy().to_string();
+    if !paths.contains(&as_str) {
+        paths.push(as_str);
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
