@@ -12,7 +12,7 @@ pub struct Session {
     pub last_line: String,
 }
 
-pub fn list_sessions(filter: Option<&str>) -> Result<Vec<Session>> {
+pub fn list_sessions() -> Result<Vec<Session>> {
     let raw = match run_tmux(&[
         "list-sessions",
         "-F",
@@ -24,10 +24,6 @@ pub fn list_sessions(filter: Option<&str>) -> Result<Vec<Session>> {
     };
 
     let mut sessions = parse_session_list(&raw)?;
-    if let Some(filter) = filter {
-        let filter = filter.to_ascii_lowercase();
-        sessions.retain(|s| s.name.to_ascii_lowercase().contains(&filter));
-    }
 
     for session in &mut sessions {
         if let Ok(cmd) = run_tmux(&[
@@ -49,7 +45,7 @@ pub fn list_sessions(filter: Option<&str>) -> Result<Vec<Session>> {
             "-t",
             &format!("{}:0.0", session.name),
             "-S",
-            "-20",
+            "-30",
         ]) {
             let lines: Vec<String> = preview
                 .lines()
@@ -62,7 +58,25 @@ pub fn list_sessions(filter: Option<&str>) -> Result<Vec<Session>> {
         }
     }
 
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(sessions)
+}
+
+pub fn create_session(name: &str, launch_command: &str) -> Result<()> {
+    let status = Command::new("tmux")
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(name)
+        .arg(launch_command)
+        .status()
+        .with_context(|| format!("failed to run tmux new-session for {name}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("tmux new-session exited with status {status}"))
+    }
 }
 
 pub fn attach_session(name: &str) -> Result<()> {
@@ -77,6 +91,21 @@ pub fn attach_session(name: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("tmux attach-session exited with status {status}"))
+    }
+}
+
+pub fn kill_session(name: &str) -> Result<()> {
+    let status = Command::new("tmux")
+        .arg("kill-session")
+        .arg("-t")
+        .arg(name)
+        .status()
+        .with_context(|| format!("failed to run tmux kill-session for {name}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("tmux kill-session exited with status {status}"))
     }
 }
 
@@ -159,9 +188,9 @@ mod tests {
 
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].name, "codex");
-        assert_eq!(parsed[0].attached, false);
+        assert!(!parsed[0].attached);
         assert_eq!(parsed[0].windows, 1);
-        assert_eq!(parsed[1].attached, true);
+        assert!(parsed[1].attached);
     }
 
     #[test]

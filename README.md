@@ -1,29 +1,30 @@
 # agentssh
 
-`agentssh` is an open-source terminal interface for managing agent sessions (`codex`, `claude`, etc.) over SSH.
+`agentssh` is an SSH-first, tabbed interface for running and managing coding agents (`codex`, `claude`, etc.) on your own VPS.
 
-It is intentionally simple:
-- `sshd` handles SSH.
-- `agentssh` renders an interactive TUI list and summary view.
-- `tmux` is the session backend.
+The design is inspired by the `terminal.shop` terminal experience:
+- top tab bar
+- dashboard + per-instance tabs
+- keyboard-first controls
+- boxed terminal panels
 
-When a user runs `ssh`, `agentssh` can be the forced command, giving a `terminal.shop`-style experience for agent sessions.
+## Architecture
 
-## Why tmux
+`agentssh` is agent-first, but keeps runtime complexity low by using `tmux` for PTY/session durability.
 
-Using tmux keeps implementation complexity low while providing:
-- durable sessions
-- safe detach/reattach
-- PTY handling
-- session lifecycle commands users already know
+- `sshd` handles remote access
+- `agentssh` handles agent discovery, tabs, summaries, and controls
+- `tmux` handles durable sessions and attach/detach behavior
 
-## Features
+## What it does
 
-- List tmux sessions with state and command summary
-- Preview recent output from each session
-- Attach directly into selected session
-- Refresh sessions manually or by interval
-- Optional name filter
+- Auto-detects installed agent CLIs in `PATH` (currently: `codex`, `claude`, `aider`, `gemini`, `opencode`)
+- Detects running agent sessions from tmux
+- Creates new agent instances from inside the UI (`n`)
+- Shows an agent dashboard list + summary panel
+- Shows each running instance as its own top tab
+- Attaches into an instance (`enter`)
+- Stops an instance (`x`)
 
 ## Quick start
 
@@ -33,22 +34,21 @@ Using tmux keeps implementation complexity low while providing:
 cargo build --release
 ```
 
-2. Create agent sessions in tmux:
-
-```bash
-tmux new-session -d -s codex "codex"
-tmux new-session -d -s claude "claude"
-```
-
-3. Run locally:
+2. Run:
 
 ```bash
 ./target/release/agentssh
 ```
 
-## Use as SSH interface
+3. Inside the app:
 
-Configure a dedicated user with `ForceCommand`.
+- press `n` to create a new agent instance
+- select an instance and press `enter` to jump in
+- detach from tmux normally (`Ctrl-b d`) and return to the manager
+
+## SSH ForceCommand setup
+
+Use a dedicated user so SSH lands directly in the manager UI.
 
 Example (`/etc/ssh/sshd_config.d/agentssh.conf`):
 
@@ -66,17 +66,20 @@ Reload SSH:
 sudo systemctl reload sshd
 ```
 
-Now `ssh agentops@your-vps` opens the agent manager UI.
+Then connect:
+
+```bash
+ssh agentops@your-vps
+```
 
 ## Controls
 
-- `j` / `k` or arrow keys: move selection
-- `enter`: attach to selected session
-- `r`: refresh now
+- `h` / `l` or left/right: switch tabs
+- `j` / `k` or up/down: move selection in dashboard list
+- `n`: new instance modal
+- `enter`: attach to selected/current instance
+- `x`: stop selected/current instance
+- `d`: go to dashboard tab
+- `r`: refresh
 - `q`: quit
-
-## CLI flags
-
-- `--filter <text>`: show only matching session names
-- `--refresh-seconds <n>`: auto-refresh interval (default: `5`)
 
