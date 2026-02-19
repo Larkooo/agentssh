@@ -1,6 +1,14 @@
 use anyhow::{Context, Result, anyhow};
 use std::process::Command;
 
+pub fn is_tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub name: String,
@@ -8,6 +16,8 @@ pub struct Session {
     pub windows: u32,
     pub created: String,
     pub current_command: String,
+    pub pane_current_path: String,
+    pub pane_title: String,
     pub preview: Vec<String>,
     pub last_line: String,
 }
@@ -26,16 +36,31 @@ pub fn list_sessions() -> Result<Vec<Session>> {
     let mut sessions = parse_session_list(&raw)?;
 
     for session in &mut sessions {
-        if let Ok(cmd) = run_tmux(&[
+        if let Ok(info) = run_tmux(&[
             "display-message",
             "-p",
             "-t",
-            &session.name,
-            "#{pane_current_command}",
+            &format!("{}:", session.name),
+            "#{pane_current_command}\t#{pane_current_path}\t#{pane_title}",
         ]) {
-            let cmd = cmd.trim();
-            if !cmd.is_empty() {
-                session.current_command = cmd.to_owned();
+            let parts: Vec<&str> = info.trim_end().splitn(3, '\t').collect();
+            if let Some(cmd) = parts.first() {
+                let cmd = cmd.trim();
+                if !cmd.is_empty() {
+                    session.current_command = cmd.to_owned();
+                }
+            }
+            if let Some(path) = parts.get(1) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    session.pane_current_path = path.to_owned();
+                }
+            }
+            if let Some(title) = parts.get(2) {
+                let title = title.trim();
+                if !title.is_empty() {
+                    session.pane_title = title.to_owned();
+                }
             }
         }
 
@@ -62,21 +87,85 @@ pub fn list_sessions() -> Result<Vec<Session>> {
     Ok(sessions)
 }
 
-pub fn create_session(name: &str, launch_command: &str) -> Result<()> {
+pub fn create_session(name: &str, working_dir: &str, shell_command: &str) -> Result<()> {
+    // Step 1: Create session with the user's default shell so .bashrc/.zshrc are
+    // sourced and PATH (nvm, pyenv, etc.) is fully configured.
     let status = Command::new("tmux")
         .arg("new-session")
         .arg("-d")
         .arg("-s")
         .arg(name)
-        .arg(launch_command)
+        .arg("-c")
+        .arg(working_dir)
         .status()
         .with_context(|| format!("failed to run tmux new-session for {name}"))?;
+
+    if !status.success() {
+        return Err(anyhow!("tmux new-session exited with status {status}"));
+    }
+
+    // Step 2: Send the command as keystrokes into the session's shell.
+    // This way the shell runs the command in its fully initialized environment,
+    // and if the agent exits, the shell stays alive so the user can see errors.
+    // NOTE: Append ":" to the session name so tmux treats dots as literal chars
+    // rather than session.window.pane separators.
+    let target = format!("{name}:");
+    let send_status = Command::new("tmux")
+        .arg("send-keys")
+        .arg("-t")
+        .arg(&target)
+        .arg(shell_command)
+        .arg("Enter")
+        .status()
+        .with_context(|| format!("failed to send command to session {name}"))?;
+
+    if !send_status.success() {
+        return Err(anyhow!("tmux send-keys exited with status {send_status}"));
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn send_keys(session_name: &str, text: &str) -> Result<()> {
+    let target = format!("{session_name}:");
+    let status = Command::new("tmux")
+        .arg("send-keys")
+        .arg("-t")
+        .arg(&target)
+        .arg(text)
+        .arg("Enter")
+        .status()
+        .with_context(|| format!("failed to send keys to session {session_name}"))?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(anyhow!("tmux new-session exited with status {status}"))
+        Err(anyhow!("tmux send-keys exited with status {status}"))
     }
+}
+
+/// Send keystrokes to a session after a delay, in a fire-and-forget background
+/// process.  This gives TUI-based agents (e.g. Codex) time to boot before
+/// receiving input.
+pub fn send_keys_delayed(session_name: &str, text: &str, delay_secs: u32) -> Result<()> {
+    let target = format!("{session_name}:");
+    // Single-quote the text for the shell, escaping inner single quotes.
+    let escaped = text.replace('\'', "'\\''");
+    // Send the text literally with -l (no key-name lookup), pause briefly for
+    // the TUI to process, then send Enter as a separate keypress.
+    let script = format!(
+        "sleep {delay_secs} && tmux send-keys -t '{target}' -l '{escaped}' && sleep 1 && tmux send-keys -t '{target}' Enter"
+    );
+    Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn delayed send-keys for {session_name}"))?;
+    Ok(())
 }
 
 pub fn attach_session(name: &str) -> Result<()> {
@@ -131,6 +220,8 @@ fn parse_session_list(raw: &str) -> Result<Vec<Session>> {
             windows,
             created: parts[3].to_owned(),
             current_command: "unknown".to_owned(),
+            pane_current_path: String::new(),
+            pane_title: String::new(),
             preview: Vec::new(),
             last_line: "(no output yet)".to_owned(),
         });
