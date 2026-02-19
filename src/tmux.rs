@@ -230,6 +230,39 @@ fn parse_session_list(raw: &str) -> Result<Vec<Session>> {
     Ok(sessions)
 }
 
+/// Lightweight polling for background activity detection.
+/// Returns `(session_name, preview_lines)` for all tmux sessions whose names
+/// start with "agentssh_".
+pub fn poll_session_previews() -> Vec<(String, Vec<String>)> {
+    let Ok(raw) = run_tmux(&["list-sessions", "-F", "#{session_name}"]) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for name in raw.lines() {
+        let name = name.trim();
+        if name.is_empty() || !name.starts_with("agentssh_") {
+            continue;
+        }
+        if let Ok(preview) = run_tmux(&[
+            "capture-pane",
+            "-p",
+            "-t",
+            &format!("{name}:0.0"),
+            "-S",
+            "-30",
+        ]) {
+            let lines: Vec<String> = preview
+                .lines()
+                .map(str::trim_end)
+                .map(ToOwned::to_owned)
+                .collect();
+            out.push((name.to_owned(), lines));
+        }
+    }
+    out
+}
+
 fn run_tmux(args: &[&str]) -> Result<String> {
     let output = Command::new("tmux")
         .args(args)

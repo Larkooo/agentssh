@@ -21,7 +21,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use std::{
-    collections::HashMap,
     env,
     io::{self, Stdout},
     time::{Duration, Instant},
@@ -112,7 +111,9 @@ struct App {
     warning: Option<Warning>,
     tmux_available: bool,
     config: config::AppConfig,
-    previous_commands: HashMap<String, String>,
+    settings_open: bool,
+    settings_selected: usize,
+    settings_editing: Option<String>,
 }
 
 impl App {
@@ -135,7 +136,9 @@ impl App {
             warning: None,
             tmux_available,
             config: cfg,
-            previous_commands: HashMap::new(),
+            settings_open: false,
+            settings_selected: 0,
+            settings_editing: None,
         }
     }
 
@@ -211,24 +214,6 @@ impl App {
                     .sort_by(|a, b| a.session.name.cmp(&b.session.name));
                 self.clamp_selection();
 
-                // Completion detection: agent binary → shell means agent finished
-                let current_cmds: Vec<(String, String)> = self
-                    .instances
-                    .iter()
-                    .map(|i| {
-                        (
-                            i.session.name.clone(),
-                            i.session.current_command.clone(),
-                        )
-                    })
-                    .collect();
-                config::detect_completions(
-                    &mut self.previous_commands,
-                    &current_cmds,
-                    &self.available_agents,
-                    &self.config,
-                );
-
                 self.status_line = format!(
                     "{} running  {}  {} agents detected",
                     self.instances.len(),
@@ -248,7 +233,7 @@ impl App {
     }
 
     fn dashboard_row_count(&self) -> usize {
-        self.instances.len() + 1
+        self.instances.len() + 2 // + action row + settings row
     }
 
     fn clamp_selection(&mut self) {
@@ -282,6 +267,10 @@ impl App {
 
     fn is_action_row_selected(&self) -> bool {
         self.selected_tab == 0 && self.selected_row == self.instances.len()
+    }
+
+    fn is_settings_row_selected(&self) -> bool {
+        self.selected_tab == 0 && self.selected_row == self.instances.len() + 1
     }
 
     fn next_row(&mut self) {
@@ -434,7 +423,8 @@ fn run(cfg: config::AppConfig) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    let mut app = App::new(cfg);
+    let mut app = App::new(cfg.clone());
+    config::spawn_activity_monitor(&cfg);
     app.refresh();
 
     let loop_result = run_loop(&mut terminal, &mut app);
@@ -466,6 +456,8 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                         handle_warning_key(app, key.code);
                     } else if app.modal.is_some() {
                         handle_modal_key(app, key.code);
+                    } else if app.settings_open {
+                        handle_settings_key(app, key.code);
                     } else {
                         handle_main_key(terminal, app, key.code)?;
                     }
@@ -636,7 +628,11 @@ fn handle_main_key(
         KeyCode::Char('x') => app.kill_selected_instance(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Enter => {
-            if app.selected_tab == 0 && app.is_action_row_selected() {
+            if app.selected_tab == 0 && app.is_settings_row_selected() {
+                app.settings_open = true;
+                app.settings_selected = 0;
+                app.settings_editing = None;
+            } else if app.selected_tab == 0 && app.is_action_row_selected() {
                 app.open_spawn_modal();
             } else if let Some(instance) = app.active_instance_ref() {
                 let attach_result = attach_into_session(terminal, &instance.session.name);
@@ -654,6 +650,244 @@ fn handle_main_key(
     }
 
     Ok(())
+}
+
+const SETTINGS_COUNT: usize = 7;
+
+fn setting_label(index: usize) -> &'static str {
+    match index {
+        0 => "Refresh interval",
+        1 => "Default spawn dir",
+        2 => "Title injection",
+        3 => "Title injection delay",
+        4 => "Sound on completion",
+        5 => "Sound method",
+        6 => "Sound command",
+        _ => "",
+    }
+}
+
+fn setting_value(config: &config::AppConfig, index: usize) -> String {
+    match index {
+        0 => format!("{}", config.refresh_interval),
+        1 => config.default_spawn_dir.clone().unwrap_or_default(),
+        2 => if config.title_injection_enabled { "on".to_owned() } else { "off".to_owned() },
+        3 => format!("{}", config.title_injection_delay),
+        4 => if config.notifications.sound_on_completion { "on".to_owned() } else { "off".to_owned() },
+        5 => match config.notifications.sound_method {
+            config::SoundMethod::Bell => "bell".to_owned(),
+            config::SoundMethod::Command => "command".to_owned(),
+        },
+        6 => config.notifications.sound_command.clone(),
+        _ => String::new(),
+    }
+}
+
+fn setting_is_bool(index: usize) -> bool {
+    matches!(index, 2 | 4)
+}
+
+fn setting_is_cycle(index: usize) -> bool {
+    index == 5
+}
+
+fn apply_setting(app: &mut App, index: usize, value: &str) {
+    match index {
+        0 => {
+            if let Ok(v) = value.parse::<u64>() {
+                let v = v.max(1);
+                app.config.refresh_interval = v;
+                app.refresh_interval = Duration::from_secs(v);
+            }
+        }
+        1 => {
+            if value.is_empty() {
+                app.config.default_spawn_dir = None;
+            } else {
+                app.config.default_spawn_dir = Some(value.to_owned());
+            }
+        }
+        2 => {
+            app.config.title_injection_enabled = !app.config.title_injection_enabled;
+        }
+        3 => {
+            if let Ok(v) = value.parse::<u32>() {
+                app.config.title_injection_delay = v;
+            }
+        }
+        4 => {
+            app.config.notifications.sound_on_completion = !app.config.notifications.sound_on_completion;
+        }
+        5 => {
+            app.config.notifications.sound_method = match app.config.notifications.sound_method {
+                config::SoundMethod::Bell => config::SoundMethod::Command,
+                config::SoundMethod::Command => config::SoundMethod::Bell,
+            };
+        }
+        6 => {
+            app.config.notifications.sound_command = value.to_owned();
+        }
+        _ => {}
+    }
+}
+
+fn handle_settings_key(app: &mut App, code: KeyCode) {
+    if let Some(ref mut buf) = app.settings_editing {
+        // In edit mode
+        match code {
+            KeyCode::Esc => {
+                app.settings_editing = None;
+            }
+            KeyCode::Enter => {
+                let value = buf.clone();
+                let idx = app.settings_selected;
+                apply_setting(app, idx, &value);
+                app.settings_editing = None;
+                match config::save_config(&app.config) {
+                    Ok(()) => app.status_line = "Settings saved".to_owned(),
+                    Err(e) => app.status_line = format!("Save failed: {e}"),
+                }
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.settings_open = false;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.settings_selected = (app.settings_selected + 1) % SETTINGS_COUNT;
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if app.settings_selected == 0 {
+                app.settings_selected = SETTINGS_COUNT - 1;
+            } else {
+                app.settings_selected -= 1;
+            }
+        }
+        KeyCode::Enter => {
+            let idx = app.settings_selected;
+            if setting_is_bool(idx) {
+                apply_setting(app, idx, "");
+                match config::save_config(&app.config) {
+                    Ok(()) => app.status_line = "Settings saved".to_owned(),
+                    Err(e) => app.status_line = format!("Save failed: {e}"),
+                }
+            } else if setting_is_cycle(idx) {
+                apply_setting(app, idx, "");
+                match config::save_config(&app.config) {
+                    Ok(()) => app.status_line = "Settings saved".to_owned(),
+                    Err(e) => app.status_line = format!("Save failed: {e}"),
+                }
+            } else {
+                app.settings_editing = Some(setting_value(&app.config, idx));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn draw_settings_view(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let t = app.theme;
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "settings",
+            Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for i in 0..SETTINGS_COUNT {
+        let label = setting_label(i);
+        let selected = i == app.settings_selected;
+
+        let is_editing = selected && app.settings_editing.is_some();
+
+        let value_display = if is_editing {
+            let buf = app.settings_editing.as_deref().unwrap_or("");
+            format!("{}_", buf)
+        } else {
+            setting_value(&app.config, i)
+        };
+
+        let row_style = if selected {
+            Style::default()
+                .fg(t.bg)
+                .bg(t.highlight_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(t.text)
+        };
+
+        // For booleans, color the value green/muted when not selected
+        let value_style = if selected {
+            row_style
+        } else if setting_is_bool(i) {
+            let on = match i {
+                2 => app.config.title_injection_enabled,
+                4 => app.config.notifications.sound_on_completion,
+                _ => false,
+            };
+            if on {
+                Style::default().fg(t.green)
+            } else {
+                Style::default().fg(t.muted)
+            }
+        } else {
+            Style::default().fg(t.muted)
+        };
+
+        let padded_label = format!("{:<24}", label);
+        lines.push(Line::from(vec![
+            Span::styled(padded_label, row_style),
+            Span::styled(value_display, value_style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Custom [[agents]] entries are not editable here — edit config.toml directly.",
+        Style::default().fg(t.muted),
+    )));
+
+    // Footer hints
+    lines.push(Line::from(""));
+    let key_style = Style::default().fg(t.text).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(t.muted);
+
+    if app.settings_editing.is_some() {
+        lines.push(Line::from(vec![
+            Span::styled("enter", key_style),
+            Span::styled(" save   ", desc_style),
+            Span::styled("esc", key_style),
+            Span::styled(" discard", desc_style),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("\u{2191}/\u{2193}", key_style),
+            Span::styled(" navigate   ", desc_style),
+            Span::styled("enter", key_style),
+            Span::styled(" edit/toggle   ", desc_style),
+            Span::styled("esc", key_style),
+            Span::styled(" back", desc_style),
+        ]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().fg(t.text).bg(t.bg))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn attach_into_session(
@@ -782,7 +1016,9 @@ fn draw_main_screen(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     draw_header(frame, sections[0], app);
 
-    if app.selected_tab == 0 {
+    if app.settings_open {
+        draw_settings_view(frame, sections[2], app);
+    } else if app.selected_tab == 0 {
         draw_dashboard(frame, sections[2], app);
     } else {
         draw_instance_tab(frame, sections[2], app);
@@ -993,7 +1229,7 @@ fn draw_instance_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             };
 
             lines.push(Line::from(Span::styled(label, style)));
-        } else {
+        } else if index == app.instances.len() {
             // "New Instance" action row
             if !lines.is_empty() {
                 lines.push(Line::from(""));
@@ -1007,6 +1243,17 @@ fn draw_instance_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(t.accent)
             };
             lines.push(Line::from(Span::styled("+ new instance", style)));
+        } else {
+            // "Settings" row
+            let style = if selected {
+                Style::default()
+                    .fg(t.bg)
+                    .bg(t.highlight_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.accent)
+            };
+            lines.push(Line::from(Span::styled("# settings", style)));
         }
     }
 
@@ -1028,7 +1275,84 @@ fn draw_instance_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn draw_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let t = app.theme;
 
-    let lines = if app.is_action_row_selected() || app.instances.is_empty() {
+    let lines = if app.is_settings_row_selected() {
+        let c = &app.config;
+        vec![
+            Line::from(Span::styled(
+                "settings",
+                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press enter to edit settings.",
+                Style::default().fg(t.text),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("config   ", Style::default().fg(t.muted)),
+                Span::styled(
+                    format!("{}", config::config_path().display()),
+                    Style::default().fg(t.text),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "~ current values ~",
+                Style::default().fg(t.accent),
+            )),
+            Line::from(vec![
+                Span::styled("refresh interval       ", Style::default().fg(t.muted)),
+                Span::styled(format!("{}s", c.refresh_interval), Style::default().fg(t.text)),
+            ]),
+            Line::from(vec![
+                Span::styled("default spawn dir      ", Style::default().fg(t.muted)),
+                Span::styled(
+                    c.default_spawn_dir.as_deref().unwrap_or("(none)").to_owned(),
+                    Style::default().fg(t.text),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("title injection        ", Style::default().fg(t.muted)),
+                Span::styled(
+                    if c.title_injection_enabled { "on" } else { "off" },
+                    if c.title_injection_enabled {
+                        Style::default().fg(t.green)
+                    } else {
+                        Style::default().fg(t.muted)
+                    },
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("title injection delay  ", Style::default().fg(t.muted)),
+                Span::styled(format!("{}s", c.title_injection_delay), Style::default().fg(t.text)),
+            ]),
+            Line::from(vec![
+                Span::styled("sound on completion    ", Style::default().fg(t.muted)),
+                Span::styled(
+                    if c.notifications.sound_on_completion { "on" } else { "off" },
+                    if c.notifications.sound_on_completion {
+                        Style::default().fg(t.green)
+                    } else {
+                        Style::default().fg(t.muted)
+                    },
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("sound method           ", Style::default().fg(t.muted)),
+                Span::styled(
+                    match c.notifications.sound_method {
+                        config::SoundMethod::Bell => "bell",
+                        config::SoundMethod::Command => "command",
+                    },
+                    Style::default().fg(t.text),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("sound command          ", Style::default().fg(t.muted)),
+                Span::styled(c.notifications.sound_command.clone(), Style::default().fg(t.text)),
+            ]),
+        ]
+    } else if app.is_action_row_selected() || app.instances.is_empty() {
         let mut l = vec![
             Line::from(Span::styled(
                 "new instance",

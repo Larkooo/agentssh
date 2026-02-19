@@ -1,10 +1,13 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
-use std::{env, fs};
+use std::time::{Duration, Instant};
+use std::{env, fs, thread};
 
-use crate::agents;
+use crate::tmux;
 
 // ── Raw TOML representation (all fields optional) ───────────────────────────
 
@@ -28,7 +31,7 @@ struct NotificationsConfigFile {
     sound_command: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CustomAgentConfig {
     pub id: String,
     pub label: String,
@@ -71,7 +74,7 @@ impl Default for AppConfig {
             title_injection_delay: 5,
             notifications: NotificationsConfig {
                 sound_on_completion: true,
-                sound_method: SoundMethod::Bell,
+                sound_method: SoundMethod::Command,
                 sound_command: "afplay /System/Library/Sounds/Glass.aiff".to_owned(),
             },
             custom_agents: Vec::new(),
@@ -136,6 +139,55 @@ pub fn load_config() -> AppConfig {
     config
 }
 
+// ── Save support ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ConfigFileSave {
+    refresh_interval: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_spawn_dir: Option<String>,
+    title_injection_enabled: bool,
+    title_injection_delay: u32,
+    notifications: NotificationsConfigFileSave,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<CustomAgentConfig>,
+}
+
+#[derive(Serialize)]
+struct NotificationsConfigFileSave {
+    sound_on_completion: bool,
+    sound_method: String,
+    sound_command: String,
+}
+
+pub fn save_config(config: &AppConfig) -> Result<(), String> {
+    let save = ConfigFileSave {
+        refresh_interval: config.refresh_interval,
+        default_spawn_dir: config.default_spawn_dir.clone(),
+        title_injection_enabled: config.title_injection_enabled,
+        title_injection_delay: config.title_injection_delay,
+        notifications: NotificationsConfigFileSave {
+            sound_on_completion: config.notifications.sound_on_completion,
+            sound_method: match config.notifications.sound_method {
+                SoundMethod::Bell => "bell".to_owned(),
+                SoundMethod::Command => "command".to_owned(),
+            },
+            sound_command: config.notifications.sound_command.clone(),
+        },
+        agents: config.custom_agents.clone(),
+    };
+
+    let content = toml::to_string_pretty(&save).map_err(|e| format!("serialize: {e}"))?;
+
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+    }
+    fs::write(&path, content).map_err(|e| format!("write: {e}"))?;
+
+    Ok(())
+}
+
 pub fn apply_cli_overrides(config: &mut AppConfig, refresh_seconds: Option<u64>) {
     if let Some(v) = refresh_seconds {
         config.refresh_interval = v.max(1);
@@ -167,80 +219,103 @@ pub fn play_notification_sound(config: &AppConfig) {
     }
 }
 
-/// Returns true if the command name looks like a shell (used for completion
-/// detection: agent binary → shell means the agent finished).
-pub fn is_shell(cmd: &str) -> bool {
-    let name = std::path::Path::new(cmd)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| cmd.to_owned());
+// ── Motion-based completion detection (background thread) ────────────────────
 
-    // Strip leading dash for login shells (e.g. "-zsh")
-    let name = name.strip_prefix('-').unwrap_or(&name);
+const SETTLE_SECONDS: u64 = 8;
 
-    matches!(
-        name,
-        "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "csh" | "nu" | "nushell"
-    )
+struct SessionActivity {
+    content_hash: u64,
+    last_change: Instant,
+    was_active: bool,
+    notified: bool,
 }
 
-/// Check if a command was an agent binary. Uses agents module helpers.
-pub fn is_agent_command(
-    command: &str,
-    available_agents: &[agents::AgentDefinition],
-) -> bool {
-    let Some(binary) = agents::command_binary(command) else {
-        return false;
-    };
-    available_agents
+/// Hash preview lines, stripping trailing empty lines first so that pane
+/// resize (which changes the number of trailing blanks) doesn't cause
+/// spurious hash changes.
+fn hash_preview(lines: &[String]) -> u64 {
+    let end = lines
         .iter()
-        .any(|a| agents::binary_matches(&binary, &a.binary))
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut hasher = DefaultHasher::new();
+    lines[..end].hash(&mut hasher);
+    hasher.finish()
 }
 
-/// Track previous commands and detect completion transitions.
-pub fn detect_completions(
-    previous_commands: &mut HashMap<String, String>,
-    instances: &[(String, String)], // (session_name, current_command)
-    available_agents: &[agents::AgentDefinition],
+/// Run one detection tick. Returns names of sessions that fired a notification.
+fn detect_tick(
+    activity: &mut HashMap<String, SessionActivity>,
+    sessions: &[(String, Vec<String>)],
     config: &AppConfig,
-) {
-    for (session_name, current_command) in instances {
-        if let Some(prev) = previous_commands.get(session_name) {
-            if is_agent_command(prev, available_agents) && is_shell(current_command) {
-                play_notification_sound(config);
+) -> Vec<String> {
+    let now = Instant::now();
+    let mut completed = Vec::new();
+
+    for (name, preview) in sessions {
+        let hash = hash_preview(preview);
+
+        match activity.get_mut(name) {
+            Some(entry) => {
+                if hash != entry.content_hash {
+                    entry.content_hash = hash;
+                    entry.last_change = now;
+                    entry.was_active = true;
+                    entry.notified = false;
+                } else if entry.was_active
+                    && !entry.notified
+                    && now.duration_since(entry.last_change).as_secs() >= SETTLE_SECONDS
+                {
+                    play_notification_sound(config);
+                    entry.notified = true;
+                    completed.push(name.clone());
+                }
+            }
+            None => {
+                activity.insert(
+                    name.clone(),
+                    SessionActivity {
+                        content_hash: hash,
+                        last_change: now,
+                        was_active: false,
+                        notified: true,
+                    },
+                );
             }
         }
-        previous_commands.insert(session_name.clone(), current_command.clone());
     }
 
-    // Remove entries for sessions that no longer exist
     let active_names: std::collections::HashSet<&String> =
-        instances.iter().map(|(name, _)| name).collect();
-    previous_commands.retain(|name, _| active_names.contains(name));
+        sessions.iter().map(|(name, _)| name).collect();
+    activity.retain(|name, _| active_names.contains(name));
+
+    completed
+}
+
+/// Spawn a background thread that polls tmux pane content and fires
+/// notification sounds when an agent's output settles. Runs independently
+/// of the TUI event loop so notifications work even while attached to a
+/// session.
+pub fn spawn_activity_monitor(config: &AppConfig) {
+    let config = config.clone();
+    let interval = Duration::from_secs(config.refresh_interval.max(1));
+
+    thread::spawn(move || {
+        let mut activity: HashMap<String, SessionActivity> = HashMap::new();
+
+        loop {
+            thread::sleep(interval);
+
+            let sessions = tmux::poll_session_previews();
+            detect_tick(&mut activity, &sessions, &config);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn is_shell_detects_common_shells() {
-        assert!(is_shell("zsh"));
-        assert!(is_shell("bash"));
-        assert!(is_shell("fish"));
-        assert!(is_shell("-zsh"));
-        assert!(is_shell("-bash"));
-        assert!(is_shell("/bin/zsh"));
-        assert!(is_shell("/usr/local/bin/fish"));
-    }
-
-    #[test]
-    fn is_shell_rejects_non_shells() {
-        assert!(!is_shell("claude"));
-        assert!(!is_shell("codex"));
-        assert!(!is_shell("node"));
-        assert!(!is_shell("python"));
-    }
 
     #[test]
     fn default_config_has_sensible_values() {
@@ -249,7 +324,7 @@ mod tests {
         assert!(config.title_injection_enabled);
         assert_eq!(config.title_injection_delay, 5);
         assert!(config.notifications.sound_on_completion);
-        assert_eq!(config.notifications.sound_method, SoundMethod::Bell);
+        assert_eq!(config.notifications.sound_method, SoundMethod::Command);
     }
 
     #[test]
