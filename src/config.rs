@@ -18,6 +18,7 @@ struct ConfigFile {
     default_spawn_dir: Option<String>,
     title_injection_enabled: Option<bool>,
     title_injection_delay: Option<u32>,
+    git_worktrees: Option<bool>,
     notifications: Option<NotificationsConfigFile>,
     #[serde(default)]
     agents: Vec<CustomAgentConfig>,
@@ -61,6 +62,7 @@ pub struct AppConfig {
     pub default_spawn_dir: Option<String>,
     pub title_injection_enabled: bool,
     pub title_injection_delay: u32,
+    pub git_worktrees: bool,
     pub notifications: NotificationsConfig,
     pub custom_agents: Vec<CustomAgentConfig>,
 }
@@ -72,6 +74,7 @@ impl Default for AppConfig {
             default_spawn_dir: None,
             title_injection_enabled: true,
             title_injection_delay: 5,
+            git_worktrees: false,
             notifications: NotificationsConfig {
                 sound_on_completion: true,
                 sound_method: SoundMethod::Command,
@@ -119,6 +122,9 @@ pub fn load_config() -> AppConfig {
     if let Some(v) = file.title_injection_delay {
         config.title_injection_delay = v;
     }
+    if let Some(v) = file.git_worktrees {
+        config.git_worktrees = v;
+    }
 
     if let Some(notif) = file.notifications {
         if let Some(v) = notif.sound_on_completion {
@@ -148,6 +154,7 @@ struct ConfigFileSave {
     default_spawn_dir: Option<String>,
     title_injection_enabled: bool,
     title_injection_delay: u32,
+    git_worktrees: bool,
     notifications: NotificationsConfigFileSave,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     agents: Vec<CustomAgentConfig>,
@@ -166,6 +173,7 @@ pub fn save_config(config: &AppConfig) -> Result<(), String> {
         default_spawn_dir: config.default_spawn_dir.clone(),
         title_injection_enabled: config.title_injection_enabled,
         title_injection_delay: config.title_injection_delay,
+        git_worktrees: config.git_worktrees,
         notifications: NotificationsConfigFileSave {
             sound_on_completion: config.notifications.sound_on_completion,
             sound_method: match config.notifications.sound_method {

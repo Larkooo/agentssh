@@ -1,5 +1,6 @@
 mod agents;
 mod config;
+mod git;
 mod pathnav;
 mod tmux;
 
@@ -46,6 +47,7 @@ enum SpawnStep {
     Agent,
     Path,
     NewDirectoryName,
+    CloneUrl,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,7 @@ struct SpawnModal {
     selected_agent: usize,
     browser: Browser,
     new_dir_name: String,
+    clone_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +333,7 @@ impl App {
                     selected_agent: 0,
                     browser,
                     new_dir_name: String::new(),
+                    clone_url: String::new(),
                 });
             }
             Err(err) => {
@@ -345,12 +349,25 @@ impl App {
             return;
         };
 
+        let final_dir =
+            if self.config.git_worktrees && git::is_git_repo(std::path::Path::new(&working_dir)) {
+                match git::create_worktree(std::path::Path::new(&working_dir)) {
+                    Ok(wt_path) => wt_path.to_string_lossy().to_string(),
+                    Err(err) => {
+                        self.status_line = format!("Worktree failed: {err}, using original dir");
+                        working_dir.clone()
+                    }
+                }
+            } else {
+                working_dir.clone()
+            };
+
         let session_name = agents::build_managed_session_name(&agent.id);
         let title_enabled = self.config.title_injection_enabled;
 
         let launch_cmd = agents::build_launch_command(&agent, title_enabled);
 
-        match tmux::create_session(&session_name, &working_dir, &launch_cmd) {
+        match tmux::create_session(&session_name, &final_dir, &launch_cmd) {
             Ok(()) => {
                 // For agents without a system-prompt flag, inject a first
                 // message asking them to write task titles to a temp file.
@@ -361,7 +378,7 @@ impl App {
                     let _ = tmux::send_keys_delayed(&session_name, &msg, delay);
                 }
 
-                self.status_line = format!("Started {} in {}", agent.label, working_dir);
+                self.status_line = format!("Started {} in {}", agent.label, final_dir);
                 self.modal = None;
                 self.refresh();
 
@@ -494,6 +511,9 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
         CreateDirectory {
             name: String,
         },
+        CloneRepo {
+            url: String,
+        },
     }
 
     let mut action = Action::None;
@@ -548,6 +568,10 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
                         modal.step = SpawnStep::NewDirectoryName;
                         modal.new_dir_name.clear();
                     }
+                    Ok(ActivateResult::StartCloneFromUrl) => {
+                        modal.step = SpawnStep::CloneUrl;
+                        modal.clone_url.clear();
+                    }
                     Err(err) => {
                         status_override = Some(format!("Path navigation failed: {err}"));
                     }
@@ -570,6 +594,26 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
                 KeyCode::Char(c) => {
                     if !c.is_control() {
                         modal.new_dir_name.push(c);
+                    }
+                }
+                _ => {}
+            },
+            SpawnStep::CloneUrl => match code {
+                KeyCode::Esc => {
+                    modal.step = SpawnStep::Path;
+                    modal.clone_url.clear();
+                }
+                KeyCode::Enter => {
+                    action = Action::CloneRepo {
+                        url: modal.clone_url.clone(),
+                    }
+                }
+                KeyCode::Backspace => {
+                    modal.clone_url.pop();
+                }
+                KeyCode::Char(c) => {
+                    if !c.is_control() {
+                        modal.clone_url.push(c);
                     }
                 }
                 _ => {}
@@ -598,6 +642,25 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
                     }
                     Err(err) => {
                         app.status_line = format!("Create directory failed: {err}");
+                    }
+                }
+            }
+        }
+        Action::CloneRepo { url } => {
+            if let Some(modal) = app.modal.as_mut() {
+                let dest = modal.browser.cwd().to_path_buf();
+                match git::clone_repo(&url, &dest) {
+                    Ok(clone_path) => {
+                        app.status_line = format!("Cloned into {}", clone_path.display());
+                        // Navigate browser into the cloned directory
+                        modal.step = SpawnStep::Path;
+                        modal.clone_url.clear();
+                        if let Ok(new_browser) = pathnav::Browser::new(clone_path) {
+                            modal.browser = new_browser;
+                        }
+                    }
+                    Err(err) => {
+                        app.status_line = format!("Clone failed: {err}");
                     }
                 }
             }
@@ -652,7 +715,7 @@ fn handle_main_key(
     Ok(())
 }
 
-const SETTINGS_COUNT: usize = 7;
+const SETTINGS_COUNT: usize = 8;
 
 fn setting_label(index: usize) -> &'static str {
     match index {
@@ -660,9 +723,10 @@ fn setting_label(index: usize) -> &'static str {
         1 => "Default spawn dir",
         2 => "Title injection",
         3 => "Title injection delay",
-        4 => "Sound on completion",
-        5 => "Sound method",
-        6 => "Sound command",
+        4 => "Git worktrees",
+        5 => "Sound on completion",
+        6 => "Sound method",
+        7 => "Sound command",
         _ => "",
     }
 }
@@ -673,22 +737,23 @@ fn setting_value(config: &config::AppConfig, index: usize) -> String {
         1 => config.default_spawn_dir.clone().unwrap_or_default(),
         2 => if config.title_injection_enabled { "on".to_owned() } else { "off".to_owned() },
         3 => format!("{}", config.title_injection_delay),
-        4 => if config.notifications.sound_on_completion { "on".to_owned() } else { "off".to_owned() },
-        5 => match config.notifications.sound_method {
+        4 => if config.git_worktrees { "on".to_owned() } else { "off".to_owned() },
+        5 => if config.notifications.sound_on_completion { "on".to_owned() } else { "off".to_owned() },
+        6 => match config.notifications.sound_method {
             config::SoundMethod::Bell => "bell".to_owned(),
             config::SoundMethod::Command => "command".to_owned(),
         },
-        6 => config.notifications.sound_command.clone(),
+        7 => config.notifications.sound_command.clone(),
         _ => String::new(),
     }
 }
 
 fn setting_is_bool(index: usize) -> bool {
-    matches!(index, 2 | 4)
+    matches!(index, 2 | 4 | 5)
 }
 
 fn setting_is_cycle(index: usize) -> bool {
-    index == 5
+    index == 6
 }
 
 fn apply_setting(app: &mut App, index: usize, value: &str) {
@@ -716,15 +781,18 @@ fn apply_setting(app: &mut App, index: usize, value: &str) {
             }
         }
         4 => {
-            app.config.notifications.sound_on_completion = !app.config.notifications.sound_on_completion;
+            app.config.git_worktrees = !app.config.git_worktrees;
         }
         5 => {
+            app.config.notifications.sound_on_completion = !app.config.notifications.sound_on_completion;
+        }
+        6 => {
             app.config.notifications.sound_method = match app.config.notifications.sound_method {
                 config::SoundMethod::Bell => config::SoundMethod::Command,
                 config::SoundMethod::Command => config::SoundMethod::Bell,
             };
         }
-        6 => {
+        7 => {
             app.config.notifications.sound_command = value.to_owned();
         }
         _ => {}
@@ -834,7 +902,8 @@ fn draw_settings_view(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         } else if setting_is_bool(i) {
             let on = match i {
                 2 => app.config.title_injection_enabled,
-                4 => app.config.notifications.sound_on_completion,
+                4 => app.config.git_worktrees,
+                5 => app.config.notifications.sound_on_completion,
                 _ => false,
             };
             if on {
@@ -1327,6 +1396,17 @@ fn draw_summary_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 Span::styled(format!("{}s", c.title_injection_delay), Style::default().fg(t.text)),
             ]),
             Line::from(vec![
+                Span::styled("git worktrees          ", Style::default().fg(t.muted)),
+                Span::styled(
+                    if c.git_worktrees { "on" } else { "off" },
+                    if c.git_worktrees {
+                        Style::default().fg(t.green)
+                    } else {
+                        Style::default().fg(t.muted)
+                    },
+                ),
+            ]),
+            Line::from(vec![
                 Span::styled("sound on completion    ", Style::default().fg(t.muted)),
                 Span::styled(
                     if c.notifications.sound_on_completion { "on" } else { "off" },
@@ -1668,6 +1748,7 @@ fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
     };
     let path_step_style = if modal.step == SpawnStep::Path
         || modal.step == SpawnStep::NewDirectoryName
+        || modal.step == SpawnStep::CloneUrl
     {
         Style::default().fg(t.accent)
     } else {
@@ -1782,6 +1863,7 @@ fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
                 let icon = match entry.kind {
                     EntryKind::SelectCurrent => "\u{2192}",
                     EntryKind::CreateDirectory => "+",
+                    EntryKind::CloneFromUrl => "\u{21e3}",
                     EntryKind::Parent => "\u{2190}",
                     EntryKind::Directory => " ",
                 };
@@ -1791,7 +1873,7 @@ fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
                         .fg(t.bg)
                         .bg(t.highlight_bg)
                         .add_modifier(Modifier::BOLD)
-                } else if matches!(entry.kind, EntryKind::CreateDirectory) {
+                } else if matches!(entry.kind, EntryKind::CreateDirectory | EntryKind::CloneFromUrl) {
                     Style::default().fg(t.accent)
                 } else if matches!(entry.kind, EntryKind::SelectCurrent) {
                     Style::default().fg(t.green)
@@ -1859,6 +1941,41 @@ fn draw_spawn_modal(frame: &mut ratatui::Frame<'_>, app: &App) {
                     Style::default().fg(t.text).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" create   ", Style::default().fg(t.muted)),
+                Span::styled(
+                    "esc",
+                    Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" back", Style::default().fg(t.muted)),
+            ]));
+        }
+        SpawnStep::CloneUrl => {
+            lines.push(Line::from(vec![
+                Span::styled("  cwd ", Style::default().fg(t.muted)),
+                Span::styled(
+                    format!("{}", modal.browser.cwd().display()),
+                    Style::default().fg(t.text),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  git URL",
+                Style::default().fg(t.muted),
+            )));
+            lines.push(Line::from(Span::styled(
+                if modal.clone_url.is_empty() {
+                    "  _".to_owned()
+                } else {
+                    format!("  {}_", modal.clone_url)
+                },
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  enter",
+                    Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" clone   ", Style::default().fg(t.muted)),
                 Span::styled(
                     "esc",
                     Style::default().fg(t.text).add_modifier(Modifier::BOLD),

@@ -8,6 +8,7 @@ use std::{
 pub enum EntryKind {
     SelectCurrent,
     CreateDirectory,
+    CloneFromUrl,
     Parent,
     Directory,
 }
@@ -30,6 +31,7 @@ pub struct Browser {
 pub enum ActivateResult {
     Selected(PathBuf),
     StartCreateDirectory,
+    StartCloneFromUrl,
     ChangedDirectory,
 }
 
@@ -84,6 +86,7 @@ impl Browser {
         match entry.kind {
             EntryKind::SelectCurrent => Ok(ActivateResult::Selected(self.cwd.clone())),
             EntryKind::CreateDirectory => Ok(ActivateResult::StartCreateDirectory),
+            EntryKind::CloneFromUrl => Ok(ActivateResult::StartCloneFromUrl),
             EntryKind::Parent | EntryKind::Directory => {
                 self.cwd = entry.path;
                 self.refresh()?;
@@ -137,6 +140,11 @@ impl Browser {
         entries.push(Entry {
             kind: EntryKind::CreateDirectory,
             label: "Create directory here...".to_owned(),
+            path: self.cwd.clone(),
+        });
+        entries.push(Entry {
+            kind: EntryKind::CloneFromUrl,
+            label: "Clone from URL...".to_owned(),
             path: self.cwd.clone(),
         });
 
