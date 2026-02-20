@@ -8,7 +8,9 @@ use agents::AgentDefinition;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -40,6 +42,16 @@ struct AgentInstance {
     session: tmux::Session,
     managed: bool,
     title_override: String,
+}
+
+#[derive(Debug, Clone)]
+struct SplitPane {
+    session_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct SplitState {
+    panes: Vec<SplitPane>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +129,7 @@ struct App {
     settings_open: bool,
     settings_selected: usize,
     settings_editing: Option<String>,
+    split: Option<SplitState>,
 }
 
 impl App {
@@ -142,6 +155,7 @@ impl App {
             settings_open: false,
             settings_selected: 0,
             settings_editing: None,
+            split: None,
         }
     }
 
@@ -250,6 +264,21 @@ impl App {
 
         if self.selected_tab > 0 {
             self.selected_row = self.selected_tab - 1;
+        }
+
+        // Prune split panes whose sessions no longer exist
+        if let Some(split) = &mut self.split {
+            let names: std::collections::HashSet<&str> = self
+                .instances
+                .iter()
+                .map(|i| i.session.name.as_str())
+                .collect();
+            split
+                .panes
+                .retain(|p| names.contains(p.session_name.as_str()));
+            if split.panes.is_empty() {
+                self.split = None;
+            }
         }
     }
 
@@ -422,6 +451,79 @@ impl App {
             self.current_tab_instance()
         }
     }
+
+    fn is_split_mode(&self) -> bool {
+        self.split.is_some()
+    }
+
+    fn enter_split_mode(&mut self) {
+        let instance = if self.selected_tab > 0 {
+            self.current_tab_instance()
+        } else {
+            self.selected_instance()
+        };
+        let Some(instance) = instance else {
+            self.status_line = "Select an instance first".to_owned();
+            return;
+        };
+        let name = instance.session.name.clone();
+        self.split = Some(SplitState {
+            panes: vec![SplitPane {
+                session_name: name,
+            }],
+        });
+        self.status_line =
+            "Split: navigate tabs and press v to add panes, enter to launch".to_owned();
+    }
+
+    fn add_split_pane(&mut self) {
+        let Some(split) = &self.split else { return };
+        let shown: std::collections::HashSet<&str> = split
+            .panes
+            .iter()
+            .map(|p| p.session_name.as_str())
+            .collect();
+
+        // Prefer the currently viewed instance (tab or selected row)
+        let candidate = if self.selected_tab > 0 {
+            self.current_tab_instance()
+        } else {
+            self.selected_instance()
+        };
+        let next = candidate
+            .filter(|i| !shown.contains(i.session.name.as_str()))
+            .or_else(|| {
+                self.instances
+                    .iter()
+                    .find(|i| !shown.contains(i.session.name.as_str()))
+            });
+
+        if let Some(inst) = next {
+            let name = inst.session.name.clone();
+            let count = split.panes.len() + 1;
+            if let Some(split) = &mut self.split {
+                split.panes.push(SplitPane {
+                    session_name: name,
+                });
+            }
+            self.status_line = format!("Split: {count} panes selected, enter to launch");
+        } else {
+            self.status_line = "No more instances to add".to_owned();
+        }
+    }
+
+    fn close_focused_pane(&mut self) {
+        let Some(split) = &mut self.split else { return };
+        if split.panes.len() <= 1 {
+            self.split = None;
+            self.status_line = "Split cancelled".to_owned();
+            return;
+        }
+        split.panes.pop();
+        let count = split.panes.len();
+        self.status_line = format!("Split: {count} panes selected");
+    }
+
 }
 
 fn main() -> Result<()> {
@@ -476,7 +578,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                     } else if app.settings_open {
                         handle_settings_key(app, key.code);
                     } else {
-                        handle_main_key(terminal, app, key.code)?;
+                        handle_main_key(terminal, app, key.code, key.modifiers)?;
                     }
                 }
                 Event::Resize(_, _) => {}
@@ -672,7 +774,78 @@ fn handle_main_key(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     code: KeyCode,
+    _modifiers: KeyModifiers,
 ) -> Result<()> {
+    // Split-selection keybinds take priority
+    if app.is_split_mode() {
+        match code {
+            KeyCode::Char('q') => app.should_quit = true,
+            KeyCode::Esc => {
+                // Cancel split selection
+                app.split = None;
+                app.status_line = "Split cancelled".to_owned();
+            }
+            KeyCode::Char('v') => app.add_split_pane(),
+            KeyCode::Char('c') => app.close_focused_pane(),
+            // Tab navigation to browse instances while selecting
+            KeyCode::Char('h') | KeyCode::Left => app.previous_tab(),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => app.next_tab(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if app.selected_tab == 0 {
+                    app.next_row();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if app.selected_tab == 0 {
+                    app.previous_row();
+                }
+            }
+            KeyCode::Char('r') => app.refresh(),
+            KeyCode::Enter => {
+                // Launch native tmux split and attach
+                if let Some(split) = app.split.take() {
+                    let targets: Vec<String> =
+                        split.panes.iter().map(|p| p.session_name.clone()).collect();
+                    if targets.len() < 2 {
+                        app.status_line =
+                            "Add at least 2 panes (press v on another tab)".to_owned();
+                        app.split = Some(split);
+                    } else {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let split_name = format!("agentssh_split_{ts}");
+                        match tmux::create_split_session(&split_name, &targets) {
+                            Ok(()) => {
+                                let attach_result =
+                                    attach_into_session(terminal, &split_name);
+                                // Clean up temp session on return
+                                let _ = tmux::kill_session(&split_name);
+                                match attach_result {
+                                    Ok(()) => {
+                                        app.status_line = "Exited split view".to_owned()
+                                    }
+                                    Err(err) => {
+                                        app.status_line =
+                                            format!("Split attach failed: {err}")
+                                    }
+                                }
+                                app.refresh();
+                            }
+                            Err(err) => {
+                                app.status_line =
+                                    format!("Failed to create split: {err}");
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => {
@@ -688,6 +861,7 @@ fn handle_main_key(
         KeyCode::Char('h') | KeyCode::Left => app.previous_tab(),
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => app.next_tab(),
         KeyCode::Char('d') => app.selected_tab = 0,
+        KeyCode::Char('v') => app.enter_split_mode(),
         KeyCode::Char('x') => app.kill_selected_instance(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Enter => {
@@ -698,12 +872,12 @@ fn handle_main_key(
             } else if app.selected_tab == 0 && app.is_action_row_selected() {
                 app.open_spawn_modal();
             } else if let Some(instance) = app.active_instance_ref() {
-                let attach_result = attach_into_session(terminal, &instance.session.name);
+                let name = instance.session.name.clone();
+                let attach_result = attach_into_session(terminal, &name);
                 match attach_result {
-                    Ok(()) => app.status_line = format!("Detached from {}", instance.session.name),
+                    Ok(()) => app.status_line = format!("Detached from {}", name),
                     Err(err) => {
-                        app.status_line =
-                            format!("Attach failed for {}: {err}", instance.session.name)
+                        app.status_line = format!("Attach failed for {}: {err}", name)
                     }
                 }
                 app.refresh();
@@ -1116,16 +1290,26 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     struct TabCell {
         label: String,
         is_selected: bool,
+        is_in_split: bool,
     }
+
+    // Collect split pane session names for header highlighting
+    let split_names: Vec<String> = app
+        .split
+        .as_ref()
+        .map(|s| s.panes.iter().map(|p| p.session_name.clone()).collect())
+        .unwrap_or_default();
 
     let mut cells: Vec<TabCell> = Vec::new();
     cells.push(TabCell {
         label: "agentssh".to_owned(),
         is_selected: app.selected_tab == 0,
+        is_in_split: false,
     });
     cells.push(TabCell {
         label: "s sessions".to_owned(),
         is_selected: app.selected_tab == 0,
+        is_in_split: false,
     });
     for (i, instance) in app.instances.iter().enumerate() {
         let title = agents::derive_display_title(
@@ -1135,9 +1319,11 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             &instance.title_override,
         );
         let display = truncate(&title, 14);
+        let in_split = split_names.contains(&instance.session.name);
         cells.push(TabCell {
             label: format!("{} {}", instance.agent.id, display),
             is_selected: app.selected_tab == i + 1,
+            is_in_split: in_split,
         });
     }
 
@@ -1184,7 +1370,11 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         let pad_left = pad_total / 2;
         let pad_right = pad_total - pad_left;
 
-        let text_style = if cell.is_selected {
+        let text_style = if cell.is_in_split && cell.is_selected {
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+        } else if cell.is_in_split {
+            Style::default().fg(t.accent)
+        } else if cell.is_selected {
             Style::default().fg(t.text).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(t.muted)
@@ -1703,20 +1893,50 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let key_style = Style::default().fg(t.text).add_modifier(Modifier::BOLD);
     let desc_style = Style::default().fg(t.muted);
 
-    let commands = Line::from(vec![
-        Span::styled("r", key_style),
-        Span::styled(" refresh   ", desc_style),
-        Span::styled("\u{2191}/\u{2193}", key_style),
-        Span::styled(" select   ", desc_style),
-        Span::styled("enter", key_style),
-        Span::styled(" attach   ", desc_style),
-        Span::styled("\u{2190}/\u{2192}", key_style),
-        Span::styled(" tabs   ", desc_style),
-        Span::styled("x", key_style),
-        Span::styled(" stop   ", desc_style),
-        Span::styled("q", key_style),
-        Span::styled(" quit", desc_style),
-    ]);
+    let pane_count = app.split.as_ref().map(|s| s.panes.len()).unwrap_or(0);
+    let commands = if app.is_split_mode() {
+        Line::from(vec![
+            Span::styled("v", key_style),
+            Span::styled(" add pane   ", desc_style),
+            Span::styled("c", key_style),
+            Span::styled(" remove   ", desc_style),
+            Span::styled("\u{2190}/\u{2192}", key_style),
+            Span::styled(" navigate   ", desc_style),
+            Span::styled("enter", key_style),
+            Span::styled(
+                format!(
+                    " launch ({})   ",
+                    if pane_count < 2 {
+                        "need 2+".to_owned()
+                    } else {
+                        format!("{pane_count} panes")
+                    }
+                ),
+                desc_style,
+            ),
+            Span::styled("esc", key_style),
+            Span::styled(" cancel   ", desc_style),
+            Span::styled("q", key_style),
+            Span::styled(" quit", desc_style),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("r", key_style),
+            Span::styled(" refresh   ", desc_style),
+            Span::styled("\u{2191}/\u{2193}", key_style),
+            Span::styled(" select   ", desc_style),
+            Span::styled("enter", key_style),
+            Span::styled(" attach   ", desc_style),
+            Span::styled("\u{2190}/\u{2192}", key_style),
+            Span::styled(" tabs   ", desc_style),
+            Span::styled("v", key_style),
+            Span::styled(" split   ", desc_style),
+            Span::styled("x", key_style),
+            Span::styled(" stop   ", desc_style),
+            Span::styled("q", key_style),
+            Span::styled(" quit", desc_style),
+        ])
+    };
 
     frame.render_widget(
         Paragraph::new(commands)

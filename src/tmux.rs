@@ -64,11 +64,12 @@ pub fn list_sessions() -> Result<Vec<Session>> {
             }
         }
 
+        let target = format!("{}:0.0", session.name);
         if let Ok(preview) = run_tmux(&[
             "capture-pane",
             "-p",
             "-t",
-            &format!("{}:0.0", session.name),
+            &target,
             "-S",
             "-30",
         ]) {
@@ -165,6 +166,74 @@ pub fn send_keys_delayed(session_name: &str, text: &str, delay_secs: u32) -> Res
         .stderr(std::process::Stdio::null())
         .spawn()
         .with_context(|| format!("failed to spawn delayed send-keys for {session_name}"))?;
+    Ok(())
+}
+
+/// Create a temporary tmux session with side-by-side panes, each nested-
+/// attaching to one of the given target sessions.  The caller should
+/// `attach_session(name)` immediately after to enter the split view.
+pub fn create_split_session(name: &str, targets: &[String]) -> Result<()> {
+    if targets.is_empty() {
+        return Err(anyhow!("no target sessions for split"));
+    }
+
+    // Create the session; the first pane will attach to the first target.
+    let attach_cmd = format!("TMUX='' tmux attach-session -t '{}'", targets[0]);
+    let status = Command::new("tmux")
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(name)
+        .status()
+        .with_context(|| format!("failed to create split session {name}"))?;
+    if !status.success() {
+        return Err(anyhow!("tmux new-session for split exited with {status}"));
+    }
+
+    // Send the nested-attach command into the first pane.
+    let target0 = format!("{name}:");
+    let _ = Command::new("tmux")
+        .arg("send-keys")
+        .arg("-t")
+        .arg(&target0)
+        .arg(&attach_cmd)
+        .arg("Enter")
+        .status();
+
+    // For each additional target, split and nested-attach.
+    for t in &targets[1..] {
+        let _ = Command::new("tmux")
+            .arg("split-window")
+            .arg("-h")
+            .arg("-t")
+            .arg(name)
+            .status();
+
+        let attach = format!("TMUX='' tmux attach-session -t '{}'", t);
+        let _ = Command::new("tmux")
+            .arg("send-keys")
+            .arg("-t")
+            .arg(format!("{name}:"))
+            .arg(&attach)
+            .arg("Enter")
+            .status();
+    }
+
+    // Even-horizontal layout for a clean split.
+    let _ = Command::new("tmux")
+        .arg("select-layout")
+        .arg("-t")
+        .arg(name)
+        .arg("even-horizontal")
+        .status();
+
+    // Focus the first pane.
+    let _ = Command::new("tmux")
+        .arg("select-pane")
+        .arg("-t")
+        .arg(format!("{name}:.0"))
+        .status();
+
     Ok(())
 }
 
