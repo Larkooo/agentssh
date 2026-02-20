@@ -97,16 +97,22 @@ struct UiTheme {
 }
 
 impl UiTheme {
-    fn new() -> Self {
+    fn from_config(tc: &config::ThemeConfig) -> Self {
+        let c = |opt: Option<[u8; 3]>, default: Color| -> Color {
+            match opt {
+                Some([r, g, b]) => Color::Rgb(r, g, b),
+                None => default,
+            }
+        };
         Self {
-            bg: Color::Rgb(0, 0, 0),
-            border: Color::Rgb(70, 60, 55),
-            text: Color::Rgb(215, 205, 195),
-            muted: Color::Rgb(130, 120, 110),
-            accent: Color::Rgb(207, 144, 89),     // claude terracotta/clay
-            highlight_bg: Color::Rgb(191, 111, 74), // warm sienna
-            yellow: Color::Rgb(228, 175, 105),    // warm amber
-            green: Color::Rgb(169, 195, 140),     // sage green
+            bg: c(tc.bg, Color::Rgb(0, 0, 0)),
+            border: c(tc.border, Color::Rgb(70, 60, 55)),
+            text: c(tc.text, Color::Rgb(215, 205, 195)),
+            muted: c(tc.muted, Color::Rgb(130, 120, 110)),
+            accent: c(tc.accent, Color::Rgb(207, 144, 89)),
+            highlight_bg: c(tc.highlight, Color::Rgb(191, 111, 74)),
+            yellow: c(tc.yellow, Color::Rgb(228, 175, 105)),
+            green: c(tc.green, Color::Rgb(169, 195, 140)),
         }
     }
 }
@@ -147,7 +153,7 @@ impl App {
             refresh_interval,
             should_quit: false,
             status_line: String::new(),
-            theme: UiTheme::new(),
+            theme: UiTheme::from_config(&cfg.theme),
             screen: AppScreen::Main,
             warning: None,
             tmux_available,
@@ -860,10 +866,18 @@ fn handle_main_key(
         }
         KeyCode::Char('h') | KeyCode::Left => app.previous_tab(),
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => app.next_tab(),
-        KeyCode::Char('d') => app.selected_tab = 0,
+        KeyCode::Char('s') | KeyCode::Char('d') => app.selected_tab = 0,
+        KeyCode::Char('n') => app.open_spawn_modal(),
         KeyCode::Char('v') => app.enter_split_mode(),
         KeyCode::Char('x') => app.kill_selected_instance(),
         KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char(c @ '1'..='9') => {
+            let idx = (c as usize) - ('0' as usize);
+            if idx <= app.instances.len() {
+                app.selected_tab = idx;
+                app.selected_row = idx - 1;
+            }
+        }
         KeyCode::Enter => {
             if app.selected_tab == 0 && app.is_settings_row_selected() {
                 app.settings_open = true;
@@ -1307,7 +1321,7 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         is_in_split: false,
     });
     cells.push(TabCell {
-        label: "s sessions".to_owned(),
+        label: "sessions".to_owned(),
         is_selected: app.selected_tab == 0,
         is_in_split: false,
     });
@@ -1921,18 +1935,20 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ])
     } else {
         Line::from(vec![
-            Span::styled("r", key_style),
-            Span::styled(" refresh   ", desc_style),
-            Span::styled("\u{2191}/\u{2193}", key_style),
-            Span::styled(" select   ", desc_style),
+            Span::styled("s", key_style),
+            Span::styled(" sessions   ", desc_style),
+            Span::styled("1-9", key_style),
+            Span::styled(" jump   ", desc_style),
+            Span::styled("n", key_style),
+            Span::styled(" new   ", desc_style),
             Span::styled("enter", key_style),
             Span::styled(" attach   ", desc_style),
-            Span::styled("\u{2190}/\u{2192}", key_style),
-            Span::styled(" tabs   ", desc_style),
             Span::styled("v", key_style),
             Span::styled(" split   ", desc_style),
             Span::styled("x", key_style),
             Span::styled(" stop   ", desc_style),
+            Span::styled("r", key_style),
+            Span::styled(" refresh   ", desc_style),
             Span::styled("q", key_style),
             Span::styled(" quit", desc_style),
         ])

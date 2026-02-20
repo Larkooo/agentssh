@@ -20,8 +20,22 @@ struct ConfigFile {
     title_injection_delay: Option<u32>,
     git_worktrees: Option<bool>,
     notifications: Option<NotificationsConfigFile>,
+    theme: Option<ThemeConfigFile>,
     #[serde(default)]
     agents: Vec<CustomAgentConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ThemeConfigFile {
+    bg: Option<String>,
+    border: Option<String>,
+    text: Option<String>,
+    muted: Option<String>,
+    accent: Option<String>,
+    highlight: Option<String>,
+    yellow: Option<String>,
+    green: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -56,6 +70,18 @@ pub struct NotificationsConfig {
     pub sound_command: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ThemeConfig {
+    pub bg: Option<[u8; 3]>,
+    pub border: Option<[u8; 3]>,
+    pub text: Option<[u8; 3]>,
+    pub muted: Option<[u8; 3]>,
+    pub accent: Option<[u8; 3]>,
+    pub highlight: Option<[u8; 3]>,
+    pub yellow: Option<[u8; 3]>,
+    pub green: Option<[u8; 3]>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub refresh_interval: u64,
@@ -64,6 +90,7 @@ pub struct AppConfig {
     pub title_injection_delay: u32,
     pub git_worktrees: bool,
     pub notifications: NotificationsConfig,
+    pub theme: ThemeConfig,
     pub custom_agents: Vec<CustomAgentConfig>,
 }
 
@@ -80,6 +107,7 @@ impl Default for AppConfig {
                 sound_method: SoundMethod::Command,
                 sound_command: "afplay /System/Library/Sounds/Glass.aiff".to_owned(),
             },
+            theme: ThemeConfig::default(),
             custom_agents: Vec::new(),
         }
     }
@@ -141,8 +169,30 @@ pub fn load_config() -> AppConfig {
         }
     }
 
+    if let Some(theme) = file.theme {
+        config.theme.bg = theme.bg.as_deref().and_then(parse_hex_color);
+        config.theme.border = theme.border.as_deref().and_then(parse_hex_color);
+        config.theme.text = theme.text.as_deref().and_then(parse_hex_color);
+        config.theme.muted = theme.muted.as_deref().and_then(parse_hex_color);
+        config.theme.accent = theme.accent.as_deref().and_then(parse_hex_color);
+        config.theme.highlight = theme.highlight.as_deref().and_then(parse_hex_color);
+        config.theme.yellow = theme.yellow.as_deref().and_then(parse_hex_color);
+        config.theme.green = theme.green.as_deref().and_then(parse_hex_color);
+    }
+
     config.custom_agents = file.agents;
     config
+}
+
+fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
+    let s = s.strip_prefix('#').unwrap_or(s);
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some([r, g, b])
 }
 
 // ── Save support ────────────────────────────────────────────────────────────
@@ -156,8 +206,47 @@ struct ConfigFileSave {
     title_injection_delay: u32,
     git_worktrees: bool,
     notifications: NotificationsConfigFileSave,
+    #[serde(skip_serializing_if = "ThemeConfigSave::is_empty")]
+    theme: ThemeConfigSave,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     agents: Vec<CustomAgentConfig>,
+}
+
+#[derive(Serialize)]
+struct ThemeConfigSave {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    border: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    muted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    highlight: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    yellow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    green: Option<String>,
+}
+
+impl ThemeConfigSave {
+    fn is_empty(&self) -> bool {
+        self.bg.is_none()
+            && self.border.is_none()
+            && self.text.is_none()
+            && self.muted.is_none()
+            && self.accent.is_none()
+            && self.highlight.is_none()
+            && self.yellow.is_none()
+            && self.green.is_none()
+    }
+}
+
+fn rgb_to_hex(c: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
 #[derive(Serialize)]
@@ -181,6 +270,16 @@ pub fn save_config(config: &AppConfig) -> Result<(), String> {
                 SoundMethod::Command => "command".to_owned(),
             },
             sound_command: config.notifications.sound_command.clone(),
+        },
+        theme: ThemeConfigSave {
+            bg: config.theme.bg.map(rgb_to_hex),
+            border: config.theme.border.map(rgb_to_hex),
+            text: config.theme.text.map(rgb_to_hex),
+            muted: config.theme.muted.map(rgb_to_hex),
+            accent: config.theme.accent.map(rgb_to_hex),
+            highlight: config.theme.highlight.map(rgb_to_hex),
+            yellow: config.theme.yellow.map(rgb_to_hex),
+            green: config.theme.green.map(rgb_to_hex),
         },
         agents: config.custom_agents.clone(),
     };
