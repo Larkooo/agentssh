@@ -356,7 +356,9 @@ fn run_tmux(args: &[&str]) -> Result<String> {
 
 fn is_no_server_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
-    lower.contains("failed to connect to server") || lower.contains("no server running")
+    lower.contains("failed to connect to server")
+        || lower.contains("no server running")
+        || lower.contains("error connecting to")
 }
 
 fn last_non_empty_line(lines: &[String]) -> Option<&str> {
