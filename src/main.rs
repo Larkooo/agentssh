@@ -899,6 +899,22 @@ fn handle_main_key(
         KeyCode::Char('s') | KeyCode::Char('d') => app.selected_tab = 0,
         KeyCode::Char('n') => app.open_spawn_modal(),
         KeyCode::Char('v') => app.enter_split_mode(),
+        KeyCode::Char('t') => {
+            if let Some(instance) = app.active_instance_ref() {
+                let name = instance.session.name.clone();
+                let dir = if instance.session.pane_current_path.is_empty() {
+                    ".".to_owned()
+                } else {
+                    instance.session.pane_current_path.clone()
+                };
+                match tmux::split_window(&name, &dir) {
+                    Ok(()) => app.status_line = format!("Opened terminal in {name}"),
+                    Err(err) => {
+                        app.status_line = format!("Failed to split terminal: {err}")
+                    }
+                }
+            }
+        }
         KeyCode::Char('x') => app.kill_selected_instance(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char(c @ '1'..='9') => {
@@ -1973,12 +1989,12 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::styled(" new   ", desc_style),
             Span::styled("enter", key_style),
             Span::styled(" attach   ", desc_style),
+            Span::styled("t", key_style),
+            Span::styled(" terminal   ", desc_style),
             Span::styled("v", key_style),
             Span::styled(" split   ", desc_style),
             Span::styled("x", key_style),
             Span::styled(" stop   ", desc_style),
-            Span::styled("r", key_style),
-            Span::styled(" refresh   ", desc_style),
             Span::styled("q", key_style),
             Span::styled(" quit", desc_style),
         ])

@@ -127,6 +127,27 @@ pub fn create_session(name: &str, working_dir: &str, shell_command: &str) -> Res
     Ok(())
 }
 
+/// Split the active window of an existing session, adding a new shell pane
+/// in the given working directory.  The split is horizontal (side-by-side).
+pub fn split_window(session_name: &str, working_dir: &str) -> Result<()> {
+    let target = format!("{session_name}:");
+    let status = Command::new("tmux")
+        .arg("split-window")
+        .arg("-h")
+        .arg("-t")
+        .arg(&target)
+        .arg("-c")
+        .arg(working_dir)
+        .status()
+        .with_context(|| format!("failed to split window for {session_name}"))?;
+
+    if !status.success() {
+        return Err(anyhow!("tmux split-window exited with status {status}"));
+    }
+
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn send_keys(session_name: &str, text: &str) -> Result<()> {
     let target = format!("{session_name}:");
