@@ -439,9 +439,39 @@ impl App {
             return;
         };
 
+        // Check if the session was running in a worktree before killing it
+        let worktree_path = if self.config.git_worktrees
+            && !instance.session.pane_current_path.is_empty()
+        {
+            let p = std::path::Path::new(&instance.session.pane_current_path);
+            if git::is_worktree_path(p) {
+                Some(p.to_path_buf())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         match tmux::kill_session(&instance.session.name) {
             Ok(()) => {
-                self.status_line = format!("Stopped {}", instance.session.name);
+                // Clean up worktree if applicable
+                if let Some(wt) = worktree_path {
+                    match git::remove_worktree(&wt) {
+                        Ok(()) => {
+                            self.status_line =
+                                format!("Stopped {} (worktree cleaned)", instance.session.name);
+                        }
+                        Err(err) => {
+                            self.status_line = format!(
+                                "Stopped {} (worktree cleanup failed: {err})",
+                                instance.session.name
+                            );
+                        }
+                    }
+                } else {
+                    self.status_line = format!("Stopped {}", instance.session.name);
+                }
                 self.refresh();
             }
             Err(err) => {

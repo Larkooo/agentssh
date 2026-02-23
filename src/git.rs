@@ -71,6 +71,77 @@ pub fn create_worktree(repo_path: &Path) -> Result<PathBuf> {
     Ok(worktree_path)
 }
 
+/// Check if `path` is inside a `.agentssh/worktrees/` directory.
+/// Returns `true` if the path (or any parent) contains that segment.
+pub fn is_worktree_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.contains("/.agentssh/worktrees/") || s.contains("\\.agentssh\\worktrees\\")
+}
+
+/// Remove a worktree and its associated branch.
+/// `worktree_path` should be the path inside `.agentssh/worktrees/<id>/`.
+/// The branch name is derived as `agentssh/<id>`.
+pub fn remove_worktree(worktree_path: &Path) -> Result<()> {
+    // Derive the repo root: go up from .agentssh/worktrees/<id>
+    // worktree_path = <root>/.agentssh/worktrees/<id>
+    let id = worktree_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Find the main repo root by asking the worktree's git
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &worktree_path.to_string_lossy(),
+            "worktree",
+            "list",
+            "--porcelain",
+        ])
+        .output()
+        .context("failed to run git worktree list")?;
+
+    let root = if output.status.success() {
+        // First "worktree <path>" line is the main worktree
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|l| l.starts_with("worktree "))
+            .map(|l| l.strip_prefix("worktree ").unwrap_or(l).to_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Remove the worktree (--force in case of uncommitted changes)
+    if !root.is_empty() {
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                &root,
+                "worktree",
+                "remove",
+                "--force",
+                &worktree_path.to_string_lossy(),
+            ])
+            .output();
+    }
+
+    // If the directory still exists (e.g. git worktree remove failed), clean up manually
+    if worktree_path.exists() {
+        let _ = std::fs::remove_dir_all(worktree_path);
+    }
+
+    // Delete the branch
+    if !root.is_empty() && !id.is_empty() {
+        let branch = format!("agentssh/{id}");
+        let _ = Command::new("git")
+            .args(["-C", &root, "branch", "-D", &branch])
+            .output();
+    }
+
+    Ok(())
+}
+
 /// Clone `url` into `dest_dir/<repo-name>/`. Returns the clone path.
 /// Repo name is derived from the URL (last path segment minus .git).
 pub fn clone_repo(url: &str, dest_dir: &Path) -> Result<PathBuf> {
